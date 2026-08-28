@@ -410,20 +410,26 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     ActivationBarrier b = new ActivationBarrier(generation, uri);
     this.barrier = b;
 
-    boolean playIssued = false;
     try {
+      FifoOpenerSeam.OpenHandleLike handle = null;
       if (!replacement) {
-        FifoOpenerSeam.OpenHandleLike handle = opener.open(fifoPath, tuning.fifoOpenTimeout());
+        // submit the read-open first (async, cancellable — runs on the opener
+        // thread, never on this lane) ...
+        handle = opener.open(fifoPath, tuning.fifoOpenTimeout());
         this.openHandle = handle;
         machineTouched = true;
+      }
+      // ... then issue the play BEFORE awaiting the open: with
+      // wait_for_reader=true the daemon's write-open (and therefore our
+      // read-open rendezvous) fires only as a consequence of the play command.
+      CompletableFuture<Result> activation = machine.activate(lease, uri, positionMs);
+      if (!replacement) {
         InputStream stream = handle.await(); // bounded: rendezvous with the daemon's write-open
         this.openHandle = null;
         FifoReader r = readerFactory.create(stream);
         r.start();
         this.reader = r;
       }
-      playIssued = true;
-      CompletableFuture<Result> activation = machine.activate(lease, uri, positionMs);
       Result result = awaitActivation(activation, b);
       if (!result.isOk()) {
         teardownAfterFailure(result);

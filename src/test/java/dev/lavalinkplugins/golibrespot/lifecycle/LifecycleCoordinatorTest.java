@@ -544,8 +544,13 @@ class LifecycleCoordinatorTest {
         rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
 
         CompletableFuture<Result> activation = rig.coordinator.start(URI_A, 0);
-        // the daemon-equivalent writer: a blocking write-open rendezvouses with the
-        // coordinator's read-open
+        // the daemon-equivalent writer is GATED on the play command, mirroring the
+        // real wait_for_reader=true daemon: its write-open (which rendezvouses with
+        // our read-open) fires only as a consequence of the play being issued.
+        List<FakeLibrespotDaemon.RecordedCommand> beforeWriter =
+            rig.daemon.awaitCommands(1, Duration.ofSeconds(5));
+        assertThat(beforeWriter).isNotEmpty();
+        assertThat(beforeWriter.get(0).path()).as("play is the first recorded command").isEqualTo("/player/play");
         CompletableFuture<OutputStream> writer = CompletableFuture.supplyAsync(() -> {
           try {
             return new FileOutputStream(fifo.toFile());
@@ -566,6 +571,39 @@ class LifecycleCoordinatorTest {
       }
     } finally {
       FifoTestUtil.deleteTempFifo(fifo);
+    }
+  }
+
+  // ==================================================================
+  // FIFO rendezvous ordering (play before awaiting the open)
+  // ==================================================================
+
+  /**
+   * Cross-platform ordering proof (runs on Windows too): the FIFO open is
+   * awaited only AFTER the play command has reached the daemon. The gated seam
+   * blocks its {@code await()} until the fake daemon has recorded a play — with
+   * the play issued first, the open completes and activation succeeds; with the
+   * buggy await-before-play order the coordinator lane would deadlock in the
+   * open (play never issued) and this test would time out.
+   */
+  @Test
+  void playIsIssuedBeforeAwaitingFifoOpen() throws Exception {
+    try (Rig rig = newRig()) {
+      rig.newPipe();
+      ScriptedSeam.GatedHandle gated = new ScriptedSeam.GatedHandle(rig.daemon, rig.pipeIn());
+      rig.seam.supplier = () -> gated;
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok()
+          .emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+
+      Result result = rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS);
+
+      assertThat(result.isOk()).as("activation with play-gated FIFO open: " + result).isTrue();
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(gated.awaitEntered()).as("the FIFO open was awaited").isTrue();
+      assertThat(gated.playObservedBeforeReturn())
+          .as("the play reached the daemon while the open was still pending").isTrue();
     }
   }
 
@@ -716,6 +754,10 @@ class LifecycleCoordinatorTest {
       return pipeOut;
     }
 
+    PipedInputStream pipeIn() {
+      return pipeIn;
+    }
+
     @Override
     public void close() {
       try {
@@ -773,6 +815,72 @@ class LifecycleCoordinatorTest {
 
     static FifoOpenerSeam.OpenHandleLike failing(Throwable cause) {
       return new FailingHandle(cause);
+    }
+
+    /**
+     * A handle whose {@code await()} completes only after the fake daemon has
+     * recorded a play command — the ordering regression seam. With the correct
+     * play-before-await-open order the coordinator's play unblocks it and
+     * activation succeeds; with the buggy await-before-play order it blocks
+     * forever (play is never issued) and the test times out.
+     */
+    static final class GatedHandle implements FifoOpenerSeam.OpenHandleLike {
+      private final FakeLibrespotDaemon daemon;
+      private final InputStream stream;
+      private final AtomicBoolean cancelled = new AtomicBoolean();
+      private volatile boolean awaitEntered;
+      private volatile boolean playObservedBeforeReturn;
+
+      GatedHandle(FakeLibrespotDaemon daemon, InputStream stream) {
+        this.daemon = daemon;
+        this.stream = stream;
+      }
+
+      @Override
+      public InputStream await() throws InterruptedException {
+        awaitEntered = true;
+        while (!playRecorded() && !cancelled.get()) {
+          Thread.sleep(5); // test-only poll; the coordinator lane is interrupted by close()
+        }
+        if (cancelled.get()) {
+          throw new CancellationException("cancelled");
+        }
+        playObservedBeforeReturn = true;
+        return stream;
+      }
+
+      private boolean playRecorded() {
+        for (FakeLibrespotDaemon.RecordedCommand c : daemon.getReceivedCommands()) {
+          if (c.path().equals("/player/play")) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      boolean awaitEntered() {
+        return awaitEntered;
+      }
+
+      boolean playObservedBeforeReturn() {
+        return playObservedBeforeReturn;
+      }
+
+      @Override
+      public boolean cancel() {
+        cancelled.set(true);
+        return true;
+      }
+
+      @Override
+      public boolean isDone() {
+        return cancelled.get() || playObservedBeforeReturn;
+      }
+
+      @Override
+      public boolean isCancelled() {
+        return cancelled.get();
+      }
     }
 
     static final class ImmediateHandle implements FifoOpenerSeam.OpenHandleLike {

@@ -109,7 +109,7 @@ dependencies {
     // The server POM scopes its Spring Boot deps as runtime, so the test code
     // that boots the server in-JVM (SpringApplication / context classes) needs
     // an explicit test-scope Boot declaration matching the server's 3.3.0.
-    testImplementation("org.springframework.boot:spring-boot:3.3.0")
+    testImplementation("org.springframework.boot:spring-boot:4.1.1")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

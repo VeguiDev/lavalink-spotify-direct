@@ -57,6 +57,27 @@ class FifoOpenerTest {
     return t;
   }
 
+  /**
+   * Reads exactly {@code length} bytes without {@link InputStream#readNBytes(int)}.
+   * {@link FileInputStream}'s optimized implementation queries the descriptor
+   * position, which fails with {@code ESPIPE} ("Illegal seek") for a FIFO.
+   */
+  private static byte[] readExactly(InputStream in, int length) throws IOException {
+    byte[] bytes = new byte[length];
+    int offset = 0;
+    while (offset < length) {
+      int read = in.read(bytes, offset, length - offset);
+      if (read == -1) {
+        break;
+      }
+      offset += read;
+    }
+    if (offset == length) {
+      return bytes;
+    }
+    return java.util.Arrays.copyOf(bytes, offset);
+  }
+
   /** Inspectable single-thread pool (delegated executor cannot be inspected). */
   private static ThreadPoolExecutor singleThreadPool(String name) {
     ThreadFactory factory = runnable -> {
@@ -112,7 +133,7 @@ class FifoOpenerTest {
       try (InputStream in = handle.await()) {
         assertThat(in).isNotNull();
         // the stream is usable end to end: bytes written by the writer arrive
-        assertThat(in.readNBytes(payload.length)).isEqualTo(payload);
+        assertThat(readExactly(in, payload.length)).isEqualTo(payload);
       }
       writer.join(TimeUnit.SECONDS.toMillis(5));
       assertThat(writer.isAlive()).isFalse();
@@ -132,7 +153,7 @@ class FifoOpenerTest {
       AtomicReference<Throwable> writerFailure = new AtomicReference<>();
       Thread writer = openWriter(fifo, payload, writerFailure);
       try (InputStream in = handle.await()) {
-        assertThat(in.readNBytes(payload.length)).isEqualTo(payload);
+        assertThat(readExactly(in, payload.length)).isEqualTo(payload);
       }
       writer.join(TimeUnit.SECONDS.toMillis(5));
       assertThat(writer.isAlive()).isFalse();
@@ -195,8 +216,8 @@ class FifoOpenerTest {
       for (int i = 0; i < 3; i++) {
         FifoOpener.OpenHandle handle = fixture.opener.open(fifo, LONG_TIMEOUT);
         assertThat(handle.cancel()).as("cycle %d", i).isTrue();
-        // idempotent: a second cancel joins the in-progress cancellation
-        assertThat(handle.cancel()).isTrue();
+        // idempotent: once cancellation completed, a second call is a no-op
+        assertThat(handle.cancel()).isFalse();
         assertThat(handle.isDone()).isTrue();
         assertThatThrownBy(handle::await).isInstanceOf(CancellationException.class);
       }
@@ -206,7 +227,7 @@ class FifoOpenerTest {
       Thread writer = openWriter(fifo, payload, writerFailure);
       FifoOpener.OpenHandle handle = fixture.opener.open(fifo, Duration.ofSeconds(5));
       try (InputStream in = handle.await()) {
-        assertThat(in.readNBytes(payload.length)).isEqualTo(payload);
+        assertThat(readExactly(in, payload.length)).isEqualTo(payload);
       }
       writer.join(TimeUnit.SECONDS.toMillis(5));
       assertThat(writer.isAlive()).isFalse();

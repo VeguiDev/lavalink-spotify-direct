@@ -102,7 +102,7 @@ class FifoReaderTest {
     assertThat(collectBytes(reader, first.length, 5_000)).isEqualTo(first);
 
     pair.write.close();
-    await().atMost(BOUNDED).until(() -> reader.eofCount() >= 1);
+    awaitAndConsumeEof(reader, 1);
 
     // a brand-new writer session (play-over-play replacement): the reader must
     // still be draining, so the blocking write-end open completes immediately
@@ -121,14 +121,14 @@ class FifoReaderTest {
     pair.write.flush();
     assertThat(collectBytes(reader, 1, 5_000)).isEqualTo(new byte[] {1});
     pair.write.close();
-    await().atMost(BOUNDED).until(() -> reader.eofCount() == 1);
+    awaitAndConsumeEof(reader, 1);
 
     try (OutputStream w2 = new FileOutputStream(fifo.toFile())) {
       w2.write(new byte[] {2, 3});
       w2.flush();
       assertThat(collectBytes(reader, 2, 5_000)).isEqualTo(new byte[] {2, 3});
     }
-    await().atMost(BOUNDED).until(() -> reader.eofCount() == 2);
+    awaitAndConsumeEof(reader, 2);
 
     try (OutputStream w3 = new FileOutputStream(fifo.toFile())) {
       w3.write(new byte[] {4, 5, 6});
@@ -150,11 +150,7 @@ class FifoReaderTest {
       try {
         byte[] buf = new byte[chunkBytes];
         for (int i = 0; i < chunks; i++) {
-          Arrays.fill(buf, (byte) 0);
-          buf[0] = (byte) i;
-          buf[1] = (byte) (i >> 8);
-          buf[2] = (byte) (i >> 16);
-          buf[3] = (byte) (i >> 24);
+          Arrays.fill(buf, (byte) i);
           pair.write.write(buf); // OutputStream.write writes all bytes (blocking)
         }
         writerDone.countDown();
@@ -175,16 +171,16 @@ class FifoReaderTest {
     assertThat(reader.isRunning()).isTrue();
     assertThat(reader.pendingChunks()).isLessThanOrEqualTo(queueCapacity);
 
-    // Writer EOF, then reconstruct the index stream from the retained bytes.
+    // Writer EOF, then inspect the retained byte stream. FIFO reads may split
+    // writes at arbitrary offsets, so assertions must not depend on write/read
+    // chunk boundaries matching.
     pair.write.close();
-    List<Integer> indices = parseAllIndices(reader);
+    byte[] retained = drainBytesUntilEof(reader, 10_000);
 
-    assertThat(indices).isNotEmpty();
-    assertThat(indices.get(indices.size() - 1)).as("newest chunk retained").isEqualTo(chunks - 1);
-    assertThat(indices.get(0)).as("oldest chunks were dropped (drop-oldest)").isGreaterThan(0);
-    for (int i = 1; i < indices.size(); i++) {
-      assertThat(indices.get(i)).as("index stream contiguous").isEqualTo(indices.get(i - 1) + 1);
-    }
+    assertThat(retained).isNotEmpty();
+    assertThat(retained[retained.length - 1])
+        .as("newest bytes retained")
+        .isEqualTo((byte) (chunks - 1));
     assertThat(reader.droppedChunks()).isGreaterThan(0);
   }
 
@@ -210,7 +206,7 @@ class FifoReaderTest {
   void eofBoundaryLeavesNoPartialFrameWithDecoder() throws Exception {
     PcmDecoder decoder = new PcmDecoder();
     // 6 bytes = 1.5 stereo frames: L=100 R=200, then L=300 with R still pending
-    byte[] partial = {(byte) 100, 0, (byte) 200, 0, (byte) 300, 0};
+    byte[] partial = {(byte) 100, 0, (byte) 200, 0, 0x2c, 0x01};
     pair.write.write(partial);
     pair.write.flush();
     pair.write.close(); // EOF mid-frame
@@ -222,7 +218,7 @@ class FifoReaderTest {
 
     // writer reopens: the two trailing bytes complete the straddling frame
     try (OutputStream reopened = new FileOutputStream(fifo.toFile())) {
-      reopened.write(new byte[] {(byte) 400, 0});
+      reopened.write(new byte[] {(byte) 0x90, 0x01});
       reopened.flush();
       List<Short> completed = drainDecoded(decoder, reader, 5_000);
       assertThat(completed).containsExactly((short) 300, (short) 400);
@@ -306,6 +302,42 @@ class FifoReaderTest {
     return out.toByteArray();
   }
 
+  /** Waits for the requested EOF transition and removes its event from the queue. */
+  private static void awaitAndConsumeEof(FifoReader reader, long expectedCount)
+      throws InterruptedException {
+    await().atMost(BOUNDED).until(() -> reader.eofCount() >= expectedCount);
+    long deadline = System.nanoTime() + BOUNDED.toNanos();
+    while (true) {
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0) {
+        throw new AssertionError("EOF event was not delivered");
+      }
+      Event event = reader.take(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
+      if (event instanceof Event.Eof) {
+        return;
+      }
+    }
+  }
+
+  /** Drains all retained data in FIFO order until the writer's EOF event. */
+  private static byte[] drainBytesUntilEof(FifoReader reader, long timeoutMs)
+      throws InterruptedException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+    while (true) {
+      long remaining = deadline - System.nanoTime();
+      if (remaining <= 0) {
+        break;
+      }
+      Event event = reader.take(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
+      if (event == null || event instanceof Event.Eof) {
+        break;
+      }
+      out.writeBytes(((Event.Data) event).bytes());
+    }
+    return out.toByteArray();
+  }
+
   /**
    * Drains the reader until Eof (or deadline), decoding every Data event with
    * the given decoder. Eof is guaranteed to be enqueued after all Data events.
@@ -334,40 +366,4 @@ class FifoReaderTest {
     return shorts;
   }
 
-  /**
-   * Drains the reader until Eof (or deadline), parsing 4-byte little-endian
-   * index markers from the retained byte stream (chunks were written with the
-   * marker in their first 4 bytes; reads may split markers arbitrarily).
-   */
-  private static List<Integer> parseAllIndices(FifoReader reader) throws InterruptedException {
-    List<Integer> indices = new ArrayList<>();
-    byte[] acc = new byte[4];
-    int accLen = 0;
-    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-    while (true) {
-      long remaining = deadline - System.nanoTime();
-      if (remaining <= 0) {
-        break;
-      }
-      Event event = reader.take(Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remaining)));
-      if (event == null) {
-        break;
-      }
-      if (event instanceof Event.Eof) {
-        break;
-      }
-      for (byte b : ((Event.Data) event).bytes()) {
-        acc[accLen++] = b;
-        if (accLen == 4) {
-          indices.add(leInt(acc));
-          accLen = 0;
-        }
-      }
-    }
-    return indices;
-  }
-
-  private static int leInt(byte[] b) {
-    return (b[0] & 0xFF) | ((b[1] & 0xFF) << 8) | ((b[2] & 0xFF) << 16) | ((b[3] & 0xFF) << 24);
-  }
 }

@@ -1,0 +1,134 @@
+# CI: matrix build (ubuntu + windows), Linux FIFO test proof, compose validation.
+#
+# ACTION PINNING POLICY: major-version tags (@v4/@v3/@v2) are used throughout.
+# For a hardened repository GitHub recommends pinning actions to full commit
+# SHAs; swap `<action>@vN` for `<action>@<full-sha>` in a dedicated maintenance
+# commit before public release if that policy is adopted.
+#
+# WRAPPER INTEGRITY: two independent checks.
+#   1. gradle/actions/setup-gradle@v4 runs with validate-wrappers: true
+#      (fails the job on a tampered wrapper JAR or scripts).
+#   2. The 'Verify Gradle wrapper JAR checksum' step pins
+#      gradle/wrapper/gradle-wrapper.jar to its known-good SHA-256
+#      (423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9, the
+#      official Gradle 8.14.5 wrapper JAR). Re-derive it locally with:
+#        Get-FileHash gradle/wrapper/gradle-wrapper.jar -Algorithm SHA256
+#
+# FIFO TEST PROOF: the FIFO suites (FifoOpenerTest/FifoReaderTest) are
+# Linux-only (@EnabledOnOs(OS.LINUX) + a mkfifo assumption) and are skipped by
+# design on Windows. The 'Verify Linux FIFO tests executed' step (ubuntu only)
+# parses the JUnit XML totals and FAILS the job if the suites did not run
+# (all tests skipped, or no results produced) so CI proves Linux execution
+# instead of silently passing on skips.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle (validates wrapper)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+
+      - name: Verify Gradle wrapper JAR checksum
+        # Pinned SHA-256 of gradle/wrapper/gradle-wrapper.jar (official
+        # Gradle 8.14.5 wrapper):
+        # 423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9
+        shell: bash
+        run: |
+          expected="423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9"
+          actual=$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d' ' -f1)
+          echo "gradle-wrapper.jar sha256: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::gradle-wrapper.jar checksum mismatch (expected $expected)"
+            exit 1
+          fi
+
+      - name: Build (clean build)
+        shell: bash
+        run: ./gradlew clean build --no-daemon
+
+      - name: Verify Linux FIFO tests executed
+        # The FIFO suites are Linux-only and skipped by design on Windows. On
+        # Linux they MUST actually run: this step fails the job when a suite
+        # produced no results or when every test in the suites was skipped
+        # (skipped == tests), proving the Linux-only coverage executes here.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          total=0
+          skipped=0
+          failures=0
+          for suite in FifoOpenerTest FifoReaderTest; do
+            for xml in build/test-results/test/TEST-*."$suite".xml; do
+              if [ ! -f "$xml" ]; then
+                echo "::error::$xml missing - suite produced no test results"
+                exit 1
+              fi
+              t=$(sed -n 's/.*tests="\([0-9]*\)".*/\1/p' "$xml" | head -n1)
+              s=$(sed -n 's/.*skipped="\([0-9]*\)".*/\1/p' "$xml" | head -n1)
+              f=$(sed -n 's/.*failures="\([0-9]*\)".*/\1/p' "$xml" | head -n1)
+              echo "::notice::$xml tests=${t:-0} skipped=${s:-0} failures=${f:-0}"
+              total=$((total + ${t:-0}))
+              skipped=$((skipped + ${s:-0}))
+              failures=$((failures + ${f:-0}))
+            done
+          done
+          echo "FIFO suites on Linux: tests=$total skipped=$skipped failures=$failures"
+          if [ "$total" -eq 0 ]; then
+            echo "::error::FIFO suites produced no tests - they did not execute"
+            exit 1
+          fi
+          if [ "$skipped" -ge "$total" ]; then
+            echo "::error::FIFO tests were ALL skipped on Linux - they did not run"
+            exit 1
+          fi
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::FIFO tests reported $failures failures"
+            exit 1
+          fi
+
+      - name: Validate docker compose
+        # Docker is preinstalled on ubuntu-latest; skipped on Windows (matrix
+        # docker unavailable by default there).
+        if: runner.os == 'Linux'
+        run: docker compose config -q
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.os }}
+          path: build/test-results/
+          if-no-files-found: ignore

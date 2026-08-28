@@ -1,0 +1,27 @@
+# Dependency review: fails a pull_request when a dependency change
+# introduces a vulnerability above the severity threshold.
+#
+# ACTION PINNING POLICY: major-version tags (@v4) — see ci.yml header;
+# full-SHA pinning is recommended before public release.
+
+name: Dependency Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

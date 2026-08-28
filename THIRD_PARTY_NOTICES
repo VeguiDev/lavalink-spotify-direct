@@ -1,0 +1,61 @@
+# Third-Party Notices
+
+This file documents the third-party software that interacts with
+lavalink-go-librespot. This project's own source code is licensed under the
+Apache License 2.0 (see `LICENSE`).
+
+## go-librespot (external process, GPL-3.0)
+
+- Project: [go-librespot](https://github.com/devgianlu/go-librespot)
+- Version pinned by this project: tag `v0.9.0`
+  (commit `cddcada819ba01966330ce5f0b10535494443cf3`)
+- License: GNU General Public License v3.0 (GPL-3.0)
+- Role: **separate external process**. go-librespot runs as its own daemon,
+  controlled by this plugin over its REST API and `/events` WebSocket, and
+  provides audio over its pipe backend.
+
+**This project does not bundle, vendor, copy, link, embed, or derive from
+go-librespot code.** No go-librespot source code is included in this
+repository or in the distributed JAR. The two programs communicate only over
+a local network: HTTP requests, a WebSocket, and a named pipe carrying PCM.
+Because they are separate processes with separate code bases, this plugin
+does not create a combined work with go-librespot for licensing purposes.
+
+If you deploy go-librespot yourself, you are responsible for complying with
+its GPL-3.0 license, including providing its source when you distribute or
+modify it.
+
+## Lavalink and the plugin API
+
+- Project: [Lavalink](https://github.com/lavalink-devs/Lavalink)
+- Version: 4.2.x (this plugin is built against
+  `dev.arbjerg.lavalink:plugin-api:4.2.2`)
+- License: Apache License 2.0
+
+## Lavaplayer (audio pipeline)
+
+- Project: Lavaplayer fork used by the Lavalink ecosystem
+  (`dev.arbjerg:lavaplayer`), exposed transitively through the Lavalink
+  plugin API
+- License: Apache License 2.0
+
+## Java runtime dependencies
+
+The plugin has **zero runtime dependencies** beyond the JDK. HTTP and
+WebSocket communication use `java.net.http`, which is part of the Java
+standard library. Test-only dependencies (JUnit 5, AssertJ, Awaitility,
+Java-WebSocket) are used exclusively for the test suite and are not shipped
+in the release JAR.
+
+## Not legal advice
+
+These notices are provided in good faith to help you comply with license
+obligations. They are not legal advice. When in doubt about a specific
+deployment, redistribution, or modification, review the license texts
+directly and consult a qualified professional.
+
+## Unofficial project disclaimer
+
+lavalink-go-librespot is an unofficial, community project. It is not
+affiliated with, endorsed by, or sponsored by Spotify AB, the Lavalink
+project, or the go-librespot project. "Spotify" is a trademark of Spotify AB.

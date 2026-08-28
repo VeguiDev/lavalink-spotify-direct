@@ -210,12 +210,13 @@ class StopSequenceTest {
 
       Result destroyed = destroyFuture.get(5, TimeUnit.SECONDS);
       assertThat(destroyed.isOk()).as("destroy release: " + destroyed).isTrue();
-      await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
-        assertThat(rig.machine.state()).isEqualTo(MachineState.READY);
-        assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
-      });
-      assertThat(lease.isActive()).isFalse();
+      // completion contract: the destroy future completing OK implies the
+      // coordinator already observed the release — asserted synchronously
+      assertThat(rig.machine.state()).isEqualTo(MachineState.READY);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
       assertThat(rig.coordinator.currentLease()).isNull();
+      assertThat(rig.coordinator.isActive()).isFalse();
+      assertThat(lease.isActive()).isFalse();
       // destroy = pure release; no pause command, no stop endpoint
       assertThat(postPaths(rig.daemon.getReceivedCommands()))
           .containsExactly("/player/play");
@@ -524,6 +525,10 @@ class StopSequenceTest {
       Lease stoppedLease = rig.coordinator.currentLease();
       rig.daemon.pause(Response.ok().emit("paused", sharedData(URI)));
       assertThat(rig.stopSeq.logicalStop().get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      // completion contract: the stop future completing OK implies the
+      // coordinator already observed the release
+      assertThat(rig.coordinator.currentLease()).isNull();
+      assertThat(rig.coordinator.isActive()).isFalse();
       await().atMost(Duration.ofSeconds(5)).untilAsserted(
           () -> assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY));
       assertThat(stoppedLease.isActive()).isFalse();
@@ -554,6 +559,10 @@ class StopSequenceTest {
       assertThat(rig.coordinator.start(URI, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
       Lease cleanupLease = rig.coordinator.currentLease();
       assertThat(rig.stopSeq.destroy().get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      // completion contract: the destroy future completing OK implies the
+      // coordinator already observed the release
+      assertThat(rig.coordinator.currentLease()).isNull();
+      assertThat(rig.coordinator.isActive()).isFalse();
       await().atMost(Duration.ofSeconds(5)).untilAsserted(
           () -> assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY));
       assertThat(cleanupLease.isActive()).isFalse();

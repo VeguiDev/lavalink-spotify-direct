@@ -550,6 +550,13 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     if (held == null || held.isActive()) {
       return; // stale completion for an older session — ignore
     }
+    // settle bookkeeping BEFORE the potentially slow reader close: machine
+    // retire/natural-completion futures complete with the coordinator already
+    // observing the release (currentLease()==null), so consumers that key off
+    // the future never see the machine READY but the coordinator unsettled
+    completed = true;
+    lease = null;
+    machineTouched = false;
     log("natural completion on backend '" + handle.getBackendId() + "' for '" + sessionUri + "'");
     ActivationBarrier b = barrier;
     if (b != null && b.state() == ActivationBarrier.State.PENDING) {
@@ -557,9 +564,6 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     }
     closeReader();
     cancelOpenQuietly();
-    completed = true;
-    lease = null;
-    machineTouched = false;
   }
 
   @Override

@@ -187,7 +187,7 @@ public final class StopSequence implements AutoCloseable {
         pauseBudgetMs() + maxCommandBudgetMs());
     while (true) {
       if (machine.state() != MachineState.LEASED) {
-        return Result.ok("no active session"); // completed/quarantined meanwhile
+        return awaitCoordinatorSettled("logical stop"); // completed/quarantined meanwhile
       }
       Result pause = awaitPause();
       if (pause.isOk()) {
@@ -197,7 +197,7 @@ public final class StopSequence implements AutoCloseable {
         return pause; // QUARANTINED / DEGRADED / DEAD — the machine released the lease
       }
       if (machine.state() != MachineState.LEASED) {
-        return Result.ok("no active session"); // released while the pause was rejected
+        return awaitCoordinatorSettled("logical stop"); // released while the pause was rejected
       }
       if (System.nanoTime() >= deadline) {
         return Result.failed("logical stop timed out: " + pause.reason());
@@ -211,23 +211,23 @@ public final class StopSequence implements AutoCloseable {
       return Result.failed("stop sequence closed");
     }
     if (machine.state() != MachineState.LEASED) {
-      return Result.ok("no active lease to release");
+      return awaitCoordinatorSettled("destroy"); // no active lease to release
     }
     long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxCommandBudgetMs());
     while (true) {
       if (machine.state() != MachineState.LEASED) {
-        return Result.ok("already released"); // quarantine/completion released it
+        return awaitCoordinatorSettled("destroy"); // quarantine/completion released it
       }
       Result retire = awaitRetire();
       if (retire.isOk()) {
         log("lease released (destroy)");
-        return Result.ok("lease released");
+        return awaitCoordinatorSettled("destroy");
       }
       if (retire.outcome() != Outcome.FAILED) {
         return retire; // the machine owns the release path
       }
       if (machine.state() != MachineState.LEASED) {
-        return Result.ok("already released");
+        return awaitCoordinatorSettled("destroy");
       }
       if (System.nanoTime() >= deadline) {
         return Result.failed(
@@ -242,15 +242,36 @@ public final class StopSequence implements AutoCloseable {
     Result retire = awaitRetire();
     if (retire.isOk()) {
       log("retired lease after " + why);
-      return Result.ok(why + ": lease released");
+      return awaitCoordinatorSettled(why);
     }
     if (retire.outcome() != Outcome.FAILED) {
       return retire; // the machine owns the release path
     }
     if (machine.state() != MachineState.LEASED) {
-      return Result.ok(why + ": already released");
+      return awaitCoordinatorSettled(why);
     }
     return retire;
+  }
+
+  /**
+   * The completion contract: a stop/destroy future only completes OK once the
+   * coordinator has observed the release ({@code currentLease() == null}). The
+   * machine flips to READY and returns the lease to the pool BEFORE its release
+   * notification settles the coordinator's bookkeeping, so completing off
+   * machine/pool state alone can observe the pre-settlement window. This waits
+   * — bounded, park-based — for the coordinator to settle, and fails loudly
+   * instead of completing OK against an unsettled coordinator.
+   */
+  private Result awaitCoordinatorSettled(String why) {
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(settleBudgetMs());
+    while (coordinator.currentLease() != null) {
+      if (System.nanoTime() >= deadline) {
+        return Result.failed(
+            why + ": coordinator did not settle (lease still held) within " + settleBudgetMs() + "ms");
+      }
+      idleWait();
+    }
+    return Result.ok(why);
   }
 
   private Result awaitPause() {
@@ -289,6 +310,10 @@ public final class StopSequence implements AutoCloseable {
     long maxAck = Math.max(timing.activationTimeoutMs(),
         Math.max(timing.pauseAckTimeoutMs(), timing.seekAckTimeoutMs()));
     return maxAck + timing.reconcileTimeoutMs() + timing.statusPollIntervalMs() + SLACK_MS;
+  }
+
+  private long settleBudgetMs() {
+    return maxCommandBudgetMs() + RETIRE_BUDGET_MS;
   }
 
   private CompletableFuture<Result> submitOp(Supplier<Result> op) {

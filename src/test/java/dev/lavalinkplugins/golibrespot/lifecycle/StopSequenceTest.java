@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -448,7 +449,18 @@ class StopSequenceTest {
       await().atMost(Duration.ofSeconds(5)).untilAsserted(
           () -> assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY));
 
-      long before = countThreads("golibrespot-");
+      // The REAL invariant (rig-scoped and load-independent): the
+      // stop-sequence lane is exactly ONE thread for the lifecycle of this
+      // StopSequence. Capture its identity now — the warm-up cycle already
+      // forced the lane executor to spin its thread up — and re-assert
+      // identity + liveness after the cycles (a leak — a new lane thread per
+      // cycle — fails those assertions).
+      List<Thread> stopseqLane = stopseqThreads();
+      assertThat(stopseqLane).as("exactly one stopseq lane thread exists").hasSize(1);
+      Thread laneThread = stopseqLane.get(0);
+      // per-class baseline so the post-cycle check compares class-by-class
+      Map<String, Long> beforeByClass = countThreadsByExactName("golibrespot-");
+
       for (int i = 0; i < 5; i++) {
         rig.daemon.play(Response.ok().emit("playing", playingData(URI)));
         rig.daemon.status(Response.ok(playingStatus(URI)));
@@ -461,12 +473,38 @@ class StopSequenceTest {
             () -> assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY));
       }
 
-      // zero thread growth across the cycles (a lingering fifo-reader thread
-      // exits within its bounded close join)
-      await().atMost(Duration.ofSeconds(5)).untilAsserted(
-          () -> assertThat(countThreads("golibrespot-")).isLessThanOrEqualTo(before));
-      assertThat(countThreads("golibrespot-stopseq"))
-          .as("the stop sequence keeps exactly one daemon lane thread").isEqualTo(1);
+      // Invariant 1: repeated stop/play cycles spawn NO additional stopseq
+      // lane threads — the lane is still exactly one thread, still the SAME
+      // thread captured at the baseline, and still alive. A real leak (a new
+      // lane thread per cycle) fails here: the count would exceed one or the
+      // identity would differ.
+      List<Thread> stopseqAfter = stopseqThreads();
+      assertThat(stopseqAfter).as("cycles spawn no additional stopseq lane threads").hasSize(1);
+      assertThat(stopseqAfter.get(0)).as("the stopseq lane thread identity is unchanged")
+          .isSameAs(laneThread);
+      assertThat(laneThread.isAlive()).as("the stopseq lane thread is still alive").isTrue();
+
+      // Invariant 2: no NET thread growth across the cycles. The raw global
+      // 'golibrespot-' count is NOT a stable signal under load: transient
+      // threads legitimately come and go (per-session golibrespot-fifo-reader
+      // teardown, and the REST client's cached golibrespot-rest pool threads
+      // that linger up to their keep-alive). Instead assert stability:
+      //  - the per-session reader must settle back to its baseline count
+      //    within its bounded close join (a reader that never exits fails),
+      //  - every OTHER thread class — stopseq / pool-grant / machine /
+      //    coordinator / opener lanes, all singletons — must not exceed its
+      //    baseline count (a leak in any lane pushes its class count up).
+      await().atMost(Duration.ofSeconds(10)).untilAsserted(
+          () -> assertThat(countThreads("golibrespot-fifo-reader"))
+              .as("per-session fifo-reader settles back to baseline")
+              .isLessThanOrEqualTo(beforeByClass.getOrDefault("golibrespot-fifo-reader", 0L)));
+      Map<String, Long> afterByClass = countThreadsByExactName("golibrespot-");
+      assertThat(afterByClass).allSatisfy((name, count) -> {
+        if (!TRANSIENT_GOLIBRESPOT_CLASSES.contains(name)) {
+          assertThat(count).as("threads named %s", name)
+              .isLessThanOrEqualTo(beforeByClass.getOrDefault(name, 0L));
+        }
+      });
       assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
     }
   }
@@ -604,10 +642,38 @@ class StopSequenceTest {
         .collect(Collectors.toList());
   }
 
+  /**
+   * Thread-name classes that legitimately come and go under load and are
+   * therefore excluded from the strict per-class leak comparison: the
+   * per-session {@code golibrespot-fifo-reader} (exits within its bounded
+   * close join) and the REST client's cached {@code golibrespot-rest} pool
+   * threads (daemon, linger up to their keep-alive, shutdownNow on close).
+   */
+  private static final Set<String> TRANSIENT_GOLIBRESPOT_CLASSES =
+      Set.of("golibrespot-fifo-reader", "golibrespot-rest");
+
   private static long countThreads(String namePrefix) {
     return Thread.getAllStackTraces().keySet().stream()
         .filter(t -> t.isAlive() && t.getName() != null && t.getName().startsWith(namePrefix))
         .count();
+  }
+
+  /** Live threads of the stop-sequence lane (exactly one in a healthy rig). */
+  private static List<Thread> stopseqThreads() {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(t -> t.isAlive() && t.getName() != null && t.getName().startsWith("golibrespot-stopseq"))
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Live {@code golibrespot-} threads grouped by their EXACT thread name: a
+   * singleton executor lane is one named thread, so a second thread sharing
+   * its name is a leak.
+   */
+  private static Map<String, Long> countThreadsByExactName(String namePrefix) {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(t -> t.isAlive() && t.getName() != null && t.getName().startsWith(namePrefix))
+        .collect(Collectors.groupingBy(Thread::getName, Collectors.counting()));
   }
 
   private Rig newRig() {

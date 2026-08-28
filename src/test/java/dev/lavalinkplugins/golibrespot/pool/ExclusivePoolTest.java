@@ -130,9 +130,9 @@ class ExclusivePoolTest {
 
         grants.get("D").release();
         await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThat(pool.stateOf("alpha")).isEqualTo(BackendState.READY));
-        assertThat(threadB.isAlive()).isFalse();
-        assertThat(threadC.isAlive()).isFalse();
-        assertThat(threadD.isAlive()).isFalse();
+        awaitThreadExit(threadB);
+        awaitThreadExit(threadC);
+        awaitThreadExit(threadD);
     }
 
     @Test
@@ -331,7 +331,12 @@ class ExclusivePoolTest {
         assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
         assertThat(result.get()).isEmpty();
         assertThat(executor.isTerminated()).isTrue();
-        assertThat(waiter.isAlive()).isFalse();
+        // The waiter's done-latch fires from the grant path the instant
+        // acquire() returns — BEFORE the thread has finished unwinding, so
+        // isAlive() right after the latch is a happens-before race. Await
+        // actual termination first, then assert it (the pool must still
+        // drain every waiter).
+        awaitThreadExit(waiter);
         assertThat(holder.isActive()).isFalse();
         Thread grant = grantThread.get();
         await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThat(grant.isAlive()).isFalse());
@@ -419,6 +424,18 @@ class ExclusivePoolTest {
     }
 
     // ------------------------------------------------------------ helpers
+
+    /**
+     * Awaits the actual termination of a worker thread before asserting on
+     * its liveness: a done-latch / order-list observation only proves the
+     * thread finished the observed work, not that it finished unwinding, so
+     * checking isAlive() immediately is a happens-before race under load.
+     * The assertion stays — a worker that genuinely hangs fails here.
+     */
+    private static void awaitThreadExit(Thread thread) {
+        await().atMost(Duration.ofSeconds(5)).until(() -> !thread.isAlive());
+        assertThat(thread.isAlive()).isFalse();
+    }
 
     private static Thread startWaiter(String id, ExclusivePool pool, List<String> grantOrder, Map<String, Lease> grants) {
         Thread thread = new Thread(() -> {

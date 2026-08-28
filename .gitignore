@@ -1,0 +1,39 @@
+# Gradle
+.gradle/
+build/
+
+# CodeGraph index
+.codegraph/
+
+# OpenCode/agent working state
+.omo/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Secrets / environment
+.env
+.env.*
+local.properties
+*.keystore
+*.jks
+secrets*.yml
+secrets*.yaml
+application.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kotlin
+.kotlin/
+
+# Keep the wrapper jar in version control
+!gradle/wrapper/gradle-wrapper.jar

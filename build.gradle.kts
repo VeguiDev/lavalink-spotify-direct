@@ -8,7 +8,7 @@ plugins {
     // dev.arbjerg.lavalink.gradle-plugin:1.1.2.
     id("dev.arbjerg.lavalink.gradle-plugin") version "1.1.2"
     // CycloneDX SBOM generation (single owner of this config: T2).
-    id("org.cyclonedx.bom") version "2.4.1"
+    id("org.cyclonedx.bom") version "3.4.1"
 }
 
 group = "dev.lavalinkplugins.golibrespot"

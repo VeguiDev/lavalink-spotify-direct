@@ -29,6 +29,31 @@ lavalinkPlugin {
     serverVersion = "4.2.2"
 }
 
+// T23 reproducibility: the Lavalink gradle plugin writes the descriptor via
+// java.util.Properties.store(), which stamps a live "#<date>" comment line
+// into every build — that makes byte-identical rebuilds impossible. Strip the
+// comment line right after generation (the file keeps its plugin-generated
+// name/path/version keys; processResources then carries it into the jar).
+tasks.named("generatePluginProperties") {
+    doLast {
+        // The plugin writes build/generated/lavalink/main/resources/... and
+        // processResources copies it to build/resources/main/...; sanitize
+        // both (idempotent) so whichever copy reaches the jar is clean.
+        val candidates =
+            listOf(
+                layout.buildDirectory.file("generated/lavalink/main/resources/lavalink-plugins/golibrespot.properties"),
+                layout.buildDirectory.file("resources/main/lavalink-plugins/golibrespot.properties"),
+            )
+        for (descriptor in candidates) {
+            val file = descriptor.get().asFile
+            if (file.exists()) {
+                val lines = file.readLines().filterNot { it.startsWith("#") }
+                file.writeText(lines.joinToString("\n") + "\n")
+            }
+        }
+    }
+}
+
 tasks {
     compileJava {
         options.encoding = "UTF-8"
@@ -41,10 +66,21 @@ tasks {
         // Reproducible JARs: stable timestamps + stable entry order.
         isPreserveFileTimestamps = false
         isReproducibleFileOrder = true
+        // T23: ship the license + third-party notices inside the release jar
+        // (the release-artifact test asserts their presence; a release jar
+        // without its license texts would be legally deficient).
+        from("LICENSE")
+        from("THIRD_PARTY_NOTICES")
     }
 
     test {
         useJUnitPlatform()
+        // T23: the release-artifact test reads build/libs/<name>.jar. `jar`
+        // is NOT a transitive dependency of `test`, so without this the
+        // artifact test could run before (or in parallel with) the jar task
+        // in a clean build. Order it explicitly (lazy name form: inside the
+        // `tasks {}` block `tasks.jar` does not resolve).
+        dependsOn("jar")
     }
 }
 

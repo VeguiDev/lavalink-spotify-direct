@@ -1,0 +1,188 @@
+# Release: tagged release build with checksum, SBOM, attestation + publish.
+#
+# Triggered by a push of any `v*` tag (e.g. `v1.0.0`). The tag name version
+# (tag minus the leading `v`) must match the project version in
+# build.gradle.kts (1.0.0) — the jar name is derived from the tag, so a
+# mismatched tag fails loudly when the expected jar is missing.
+#
+# ACTION PINNING POLICY: major-version tags (@v4/@v2) are used throughout,
+# matching .github/workflows/ci.yml. For a hardened repository GitHub
+# recommends pinning actions to full commit SHAs; swap `<action>@vN` for
+# `<action>@<full-sha>` in a dedicated maintenance commit before public
+# release if that policy is adopted.
+#
+# WRAPPER INTEGRITY: identical to ci.yml — gradle/actions/setup-gradle@v4 runs
+# with validate-wrappers: true AND the wrapper JAR SHA-256 is pinned in a
+# dedicated step (423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9,
+# the official Gradle 8.14.5 wrapper JAR).
+#
+# RELEASE CONTRACT verified here (in addition to the JUnit release-artifact
+# suite that runs in every `clean build`):
+#   1. REPRODUCIBILITY: two `clean build --no-build-cache` runs must produce
+#      byte-identical jar SHA-256 (ReleaseArtifactTest additionally pins the
+#      two zip-level preconditions: constant entry timestamps + sorted order).
+#   2. CHECKSUM: SHA256SUMS is generated with sha256sum over the final jar.
+#   3. SBOM: `./gradlew cyclonedxBom` (plugin org.cyclonedx.bom 2.4.1,
+#      configured in build.gradle.kts — invoked, never reconfigured here)
+#      emits build/reports/bom.json + build/reports/bom.xml, both published.
+#      NOTE: the plugin's default run reports the full build graph (all
+#      resolvable configurations, test deps included). The RELEASED artifact
+#      itself has zero runtime dependencies — proven by the jar-tf whitelist
+#      in ReleaseArtifactTest (no third-party entries) — not by this SBOM.
+#   4. ATTESTATION: actions/attest-build-provenance@v2 attaches Sigstore
+#      provenance to the jar.
+#   5. PUBLISH: jar + SHA256SUMS + both SBOM files become GitHub Release
+#      assets. NO Maven Central publication, no secrets, no
+#      pull_request_target.
+#
+# Least privilege: the workflow default is contents: read; contents: write
+# (release publish), attestations: write and id-token: write (provenance) are
+# granted ONLY on the release job.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, verify, attest and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle (validates wrapper)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+
+      - name: Verify Gradle wrapper JAR checksum
+        # Pinned SHA-256 of gradle/wrapper/gradle-wrapper.jar (official
+        # Gradle 8.14.5 wrapper):
+        # 423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9
+        shell: bash
+        run: |
+          expected="423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9"
+          actual=$(sha256sum gradle/wrapper/gradle-wrapper.jar | cut -d' ' -f1)
+          echo "gradle-wrapper.jar sha256: $actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::gradle-wrapper.jar checksum mismatch (expected $expected)"
+            exit 1
+          fi
+
+      - name: Derive release jar name from tag
+        # Tag version (v1.0.0 -> 1.0.0) must match project.version in
+        # build.gradle.kts; a mismatch fails at the checksum step below
+        # because the expected jar does not exist.
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "JAR_NAME=lavalink-go-librespot-${version}.jar" >> "$GITHUB_ENV"
+          echo "Release version: $version -> $JAR_NAME"
+
+      - name: Clean build #1 (release-artifact suite runs here)
+        # --no-build-cache: the reproducibility comparison below must
+        # re-execute the jar task, not serve the cached artifact.
+        shell: bash
+        run: ./gradlew clean build --no-daemon --no-build-cache
+
+      - name: Record jar checksum (build #1)
+        shell: bash
+        run: |
+          jar="build/libs/${JAR_NAME}"
+          if [ ! -f "$jar" ]; then
+            echo "::error::expected release jar $jar does not exist (tag/version mismatch?)"
+            exit 1
+          fi
+          sha256sum "$jar" | tee /tmp/release-jar-sha-1.txt
+          cp "$jar" /tmp/release-jar-1.jar
+
+      - name: Clean build #2 (reproducibility)
+        shell: bash
+        run: ./gradlew clean build --no-daemon --no-build-cache
+
+      - name: Assert reproducible jar (build #2 sha256 == build #1)
+        shell: bash
+        run: |
+          jar="build/libs/${JAR_NAME}"
+          sha256sum "$jar" | tee /tmp/release-jar-sha-2.txt
+          sha1=$(cut -d' ' -f1 /tmp/release-jar-sha-1.txt)
+          sha2=$(cut -d' ' -f1 /tmp/release-jar-sha-2.txt)
+          echo "build #1 sha256: $sha1"
+          echo "build #2 sha256: $sha2"
+          if [ "$sha1" != "$sha2" ]; then
+            echo "::error::release jar is NOT reproducible (build #1 != build #2)"
+            exit 1
+          fi
+          echo "Reproducible: both clean builds produced byte-identical jar"
+          # Publish the build-#2 artifact (byte-identical to #1 by now).
+          cp "$jar" /tmp/release-jar-2.jar
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          (cd build/libs && sha256sum "${JAR_NAME}") > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Generate CycloneDX SBOM
+        # Invokes the org.cyclonedx.bom 2.4.1 task already configured in
+        # build.gradle.kts; output lands in build/reports/ per plugin
+        # convention (bom.json + bom.xml).
+        shell: bash
+        run: ./gradlew cyclonedxBom --no-daemon
+
+      - name: Verify SBOM parses and names our component
+        shell: bash
+        run: |
+          python3 - "$GITHUB_WORKSPACE/build/reports/bom.json" <<'EOF'
+          import json, sys
+          path = sys.argv[1]
+          with open(path, encoding='utf-8') as f:
+              bom = json.load(f)
+          assert bom.get('bomFormat') == 'CycloneDX', 'not a CycloneDX BOM'
+          comp = bom.get('metadata', {}).get('component', {})
+          assert comp.get('name') == 'lavalink-go-librespot', comp
+          assert comp.get('version') == '1.0.0', comp
+          n = len(bom.get('components', []))
+          print(f'SBOM OK: {comp["name"]} {comp["version"]}, {n} graph components '
+                f'(build graph; the released jar has zero runtime deps per the '
+                f'release-artifact suite)')
+          EOF
+          test -s build/reports/bom.json && test -s build/reports/bom.xml
+          echo "bom.json and bom.xml present"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/libs/${{ env.JAR_NAME }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/${{ env.JAR_NAME }}
+            SHA256SUMS
+            build/reports/bom.json
+            build/reports/bom.xml
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -1,0 +1,55 @@
+# Lavalink 4.2.2 configuration for the lavalink-go-librespot plugin.
+#
+# Key names under plugins.golibrespot bind strictly (fail-on-unknown) against
+# config/GoLibrespotConfig.java — do not rename them. The backends' fifoPath
+# values MUST be the exact absolute paths of the FIFOs created by the
+# fifo-init container (deploy/go-librespot/init-fifos.sh) and MUST match the
+# audio_output_pipe of each go-librespot daemon config (deploy/go-librespot/).
+# The plugin does not require the FIFOs at startup (fifoCheck: warn degrades
+# the backend until they appear), but the compose stack orders fifo-init first
+# anyway.
+
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  server:
+    # Operator value comes from .env (LAVALINK_PASSWORD); set here by
+    # compose.yaml. CHANGE IT — never run with the default.
+    password: "${LAVALINK_PASSWORD}"
+    sources:
+      youtube: false
+      bandcamp: false
+      soundcloud: false
+      twitch: false
+      vimeo: false
+      http: false
+      local: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: false
+    soundcloudSearchEnabled: false
+    gc-warnings: true
+
+plugins:
+  golibrespot:
+    enabled: true
+    # warn (default): a backend degrades until its FIFO appears instead of
+    # failing startup — the FIFOs are created by the one-shot init container.
+    fifoCheck: warn
+    backends:
+      - name: gb-1
+        restBaseUrl: http://golibrespot-1:3678
+        fifoPath: /spdirect/spdirect-1.fifo
+      - name: gb-2
+        restBaseUrl: http://golibrespot-2:3678
+        fifoPath: /spdirect/spdirect-2.fifo
+    # All timeouts default per docs/DECISIONS.md (rest 5s, metadata 5s,
+    # activation 15s, seek 10s, drain 5s/4MiB, WS backoff 1s-30s,
+    # quarantine after 5 failures, pool acquire 30s). Override any global key
+    # here or per backend.

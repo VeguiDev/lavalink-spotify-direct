@@ -1,0 +1,54 @@
+# go-librespot v0.9.0 daemon configuration — backend 1 (golibrespot-1)
+#
+# Mirrors the mandatory settings table in docs/API_CONTRACT.md §4. Keys are
+# validated against the v0.9.0 config_schema.json (tag cddcada819..., commit
+# verified 2026-08-28): the schema sets `additionalProperties: false`, so any
+# unknown key makes the daemon fail to load this file.
+#
+# NOTE: `credentials.type: interactive` is the ONLY supported login mode in
+# v0.9.0 for this deployment. `device_auth` is master-only — it is not a valid
+# v0.9.0 value. This file is Linux-only: the pipe audio backend is a stub on
+# Windows ("pipe output is not supported on Windows").
+
+log_level: info
+
+# --- pipe audio backend (mandatory) --------------------------------------
+# The FIFO is created by the `fifo-init` container at /spdirect/spdirect-1.fifo
+# (mkfifo, 0660, root:<PGID>) BEFORE this daemon starts; both this container
+# and Lavalink mount the same named volume at /spdirect.
+audio_backend: pipe
+audio_output_pipe: /spdirect/spdirect-1.fifo
+audio_output_pipe_format: s16le
+audio_output_pipe_wait_for_reader: true
+
+# --- playback semantics (mandatory) --------------------------------------
+disable_autoplay: true    # else the daemon starts an autoplay radio station
+external_volume: true     # else the daemon pre-multiplies samples by volume^2
+crossfade_duration: 0
+
+# --- API server (mandatory) -----------------------------------------------
+# The plugin talks to this REST + WS endpoint. The API is UNAUTHENTICATED:
+# this address is only reachable on the internal compose network (never
+# published to the host). server.port default is 0 = EPHEMERAL, so it MUST be
+# pinned to the port the plugin's restBaseUrl points at (3678).
+server:
+  enabled: true
+  address: 0.0.0.0
+  port: 3678
+
+# --- credentials (mandatory: interactive) ----------------------------------
+# First start prints an OAuth authorize link to the logs; complete it once
+# (see compose.yaml / README-deploy.md for the temporary port mapping on the
+# callback port). The session (state.json + credentials.json) is persisted in
+# the /config volume, so later restarts log in automatically.
+credentials:
+  type: interactive
+  interactive:
+    callback_port: 3679
+
+# --- explicit non-defaults worth pinning -----------------------------------
+# Never advertise this device over mDNS/Spotify Connect (default is off too,
+# but be explicit for a headless deployment).
+zeroconf_enabled: false
+device_type: computer
+device_name: golibrespot-1

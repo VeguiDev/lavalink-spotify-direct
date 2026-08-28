@@ -1,0 +1,38 @@
+# go-librespot v0.9.0 daemon configuration — backend 2 (golibrespot-2)
+#
+# Same mandatory settings as config.yml (docs/API_CONTRACT.md §4) with a
+# distinct FIFO path and device name, so a second daemon can run alongside the
+# first on its own Spotify login. See config.yml for the full rationale.
+#
+# v0.9.0 config_schema.json sets `additionalProperties: false` — unknown keys
+# make the daemon fail to load this file. Linux-only (pipe backend).
+
+log_level: info
+
+# --- pipe audio backend (mandatory) --------------------------------------
+audio_backend: pipe
+audio_output_pipe: /spdirect/spdirect-2.fifo
+audio_output_pipe_format: s16le
+audio_output_pipe_wait_for_reader: true
+
+# --- playback semantics (mandatory) --------------------------------------
+disable_autoplay: true
+external_volume: true
+crossfade_duration: 0
+
+# --- API server (mandatory) -----------------------------------------------
+server:
+  enabled: true
+  address: 0.0.0.0
+  port: 3678
+
+# --- credentials (mandatory: interactive) ----------------------------------
+credentials:
+  type: interactive
+  interactive:
+    callback_port: 3679
+
+# --- explicit non-defaults worth pinning -----------------------------------
+zeroconf_enabled: false
+device_type: computer
+device_name: golibrespot-2

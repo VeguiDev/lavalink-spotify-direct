@@ -1,0 +1,179 @@
+# Production Compose deployment for the lavalink-go-librespot plugin.
+#
+# Topology (Linux-only — the pipe audio backend is not supported on Windows):
+#
+#   fifo-init (one-shot, root)  ── creates /spdirect/spdirect-<n>.fifo with
+#     │                            group-writable permissions (0660 root:<PGID>)
+#     │                            and seeds the per-daemon /config volumes
+#     ▼
+#   golibrespot-1  golibrespot-2  ── go-librespot v0.9.0 daemons (credentials
+#     │                │             interactive; Spotify login per daemon)
+#     │                │             REST/WS API is UNAUTHENTICATED: no host
+#     │                │             port is ever published for the daemons.
+#     ▼                ▼
+#   lavalink ────────────────────  ── Lavalink 4.2.2 + plugin JAR + application.yml
+#                                    publishes ONLY the Lavalink port (your bot).
+#
+#   Network: one bridge (`spdirect`, NOT `internal: true` — the daemon must
+#   reach Spotify outbound at startup, verified 2026-08-28: on an internal
+#   network the daemon exits with "lookup clienttoken.spotify.com ... server
+#   misbehaving"). Isolation is achieved by publishing NO daemon ports: the
+#   unauthenticated REST/WS API is reachable only from containers on this
+#   network (and from the Docker host via the bridge) — never from the outside.
+#   Only Lavalink's 2333 is published to the host.
+#   Volumes: `fifos` (shared named volume, identical absolute path
+#   /spdirect/spdirect-<n>.fifo in every container) and one private `config-<n>`
+#   volume per daemon (state.json/credentials.json/lockfile live in the config
+#   dir — cmd/daemon/main.go `NewFileStateStore`).
+#
+# Images are pinned to verified digests (verified 2026-08-28 via
+# `docker buildx imagetools inspect`):
+#   go-librespot : ghcr.io/devgianlu/go-librespot:v0.9.0@sha256:dc7354...  (index)
+#   lavalink     : ghcr.io/lavalink-devs/lavalink:4.2.2@sha256:87ae53...  (index)
+#   alpine (init): alpine:3.20.3@sha256:1e42bbe...
+# NOTE: the digest after `@` is the multi-arch INDEX digest (resolvable by
+# docker buildx). `docker compose pull` resolves it for the host platform.
+
+name: lavalink-go-librespot
+
+x-daemon-base: &daemon-base
+  image: ghcr.io/devgianlu/go-librespot:v0.9.0@sha256:dc73546840bba05a33af381248c7a5ec8659ac8ddbcf17060f03e5a6744e9280
+  # The daemon image has no USER directive (runs as root by default). We run it
+  # as an unprivileged operator UID with the shared FIFO GID. The default PGID
+  # (322) is the `lavalink` user's group in the Lavalink image, so both the
+  # daemon (write) and the plugin JVM inside Lavalink (read) access the FIFOs
+  # via group permissions — never world-writable. If you change PGID, the
+  # Lavalink container must run with a user whose gid matches.
+  user: "${GO_LIBRESPOT_PUID:-1000}:${GO_LIBRESPOT_PGID:-322}"
+  # The image's default Cmd is `go-librespot --config_dir /config`; the config
+  # file is `config.yml` inside the config dir (config.yaml takes precedence if
+  # present). state.json (credentials + device state) and the lockfile are
+  # written next to it, so /config is a writable per-daemon volume.
+  # audio cache (if ever enabled) stays inside the same persistent volume.
+  environment:
+    XDG_CACHE_HOME: /config/cache
+  depends_on:
+    fifo-init:
+      condition: service_completed_successfully
+  healthcheck:
+    # The image ships busybox wget only (NO curl) and busybox wget TIMES OUT
+    # against the daemon API (verified 2026-08-28: keep-alive responses without
+    # a content-length hang wget). `nc` and `timeout` ARE present — send a raw
+    # HTTP/1.1 GET / with `Connection: close` and require HTTP 200, bounded by
+    # `timeout 5` (busybox nc -w is connect-only). NOTE: while the interactive
+    # login is pending, the API server does NOT answer at all (daemon/app.go:
+    # the request lane is only drained after login completes), so the container
+    # reports unhealthy until the operator finishes the OAuth flow — this is
+    # expected, not a fault. GET / always answers 200 once a session exists
+    # (API_CONTRACT §2.1); /status would answer 204 pre-login.
+    test: ["CMD-SHELL", "timeout 5 sh -c \"printf 'GET / HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' | nc 127.0.0.1:3678 | grep -q ' 200 '\""]
+    interval: 30s
+    timeout: 10s
+    retries: 5
+    start_period: 20s
+  networks:
+    - spdirect
+
+services:
+  fifo-init:
+    # One-shot initializer: creates the FIFOs before any daemon starts and
+    # seeds the per-daemon config volumes. Runs as root (needs mkfifo/chown).
+    image: alpine:3.20.3@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a
+    user: "0:0"
+    restart: "no"
+    entrypoint: ["/bin/sh", "/init-fifos.sh"]
+    environment:
+      PUID: "${GO_LIBRESPOT_PUID:-1000}"
+      PGID: "${GO_LIBRESPOT_PGID:-322}"
+      FIFO_DIR: /spdirect
+      FIFO_NAMES: "spdirect-1.fifo spdirect-2.fifo"
+      # config volume -> template file mapping (space separated, dir=file)
+      CONFIG_PAIRS: "config-1=config.yml config-2=config.2.yml"
+      CONFIG_TEMPLATE_DIR: /config-template
+    volumes:
+      - fifos:/spdirect
+      - config-1:/config-1
+      - config-2:/config-2
+      - ./deploy/go-librespot/config.yml:/config-template/config.yml:ro
+      - ./deploy/go-librespot/config.2.yml:/config-template/config.2.yml:ro
+      - ./deploy/go-librespot/init-fifos.sh:/init-fifos.sh:ro
+    networks:
+      - spdirect
+
+  golibrespot-1:
+    <<: *daemon-base
+    volumes:
+      - fifos:/spdirect
+      - config-1:/config
+    # First login (interactive, OAuth): watch `docker compose logs -f golibrespot-1`
+    # for the authorize link, then complete it. The OAuth callback binds
+    # 0.0.0.0:<callback_port> (session/oauth2.go `net.Listen("tcp", ...)`), so
+    # for the FIRST login only, uncomment the port mapping below, recreate this
+    # service, open the printed link, and remove the mapping again afterwards:
+    #   ports: ["3679:3679"]
+    # The callback server only serves the OAuth redirect (never the daemon
+    # API); remove the mapping after login anyway.
+    # command: ["--config_dir", "/config"]   # image default; left implicit
+
+  golibrespot-2:
+    <<: *daemon-base
+    volumes:
+      - fifos:/spdirect
+      - config-2:/config
+
+  lavalink:
+    image: ghcr.io/lavalink-devs/lavalink:4.2.2@sha256:87ae53e60dc147c9dddb28e126ce503a26bc8d1477ed8d99543614677882afff
+    # Image user is already non-root: `lavalink` (uid/gid 322, verified
+    # 2026-08-28). WorkingDir /opt/Lavalink, entrypoint `java -jar Lavalink.jar`
+    # → application.yml is read from /opt/Lavalink; plugins load from
+    # /opt/Lavalink/plugins.
+    depends_on:
+      fifo-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./deploy/lavalink/application.yml:/opt/Lavalink/application.yml:ro
+      # Build the plugin first: ./gradlew build
+      - ./build/libs/lavalink-go-librespot-1.0.0.jar:/opt/Lavalink/plugins/lavalink-go-librespot.jar:ro
+      - fifos:/spdirect
+    environment:
+      # The plugin config in application.yml reads ${LAVALINK_PASSWORD} from
+      # the process environment (set here from .env).
+      LAVALINK_PASSWORD: "${LAVALINK_PASSWORD:-changeme}"
+    ports:
+      # The ONLY host-exposed port of the stack: your bot's Lavalink REST/WS
+      # endpoint. Never add ports for golibrespot-* (unauthenticated API).
+      - "${LAVALINK_PORT:-2333}:2333"
+    healthcheck:
+      # /v4/info requires the Authorization header in 4.2.2, and the filter
+      # compares the header VALUE against the password verbatim — NO "Bearer "
+      # prefix (verified 2026-08-28 against the 4.2.2 source + live container:
+      # `Authorization: <password>` -> 200, `Bearer <password>` -> 403).
+      # $${LAVALINK_PASSWORD} is escaped so compose passes the literal
+      # placeholder and the CONTAINER shell expands it from the env var set
+      # above (a compose-time substitution would bake in the host value).
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: $${LAVALINK_PASSWORD}\" http://127.0.0.1:2333/v4/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - spdirect
+
+networks:
+  spdirect:
+    # NOT internal: go-librespot v0.9.0 requires outbound internet at startup
+    # (clienttoken.spotify.com / dealer / web-api / apresolve — empirically
+    # verified 2026-08-28; an `internal: true` bridge makes the daemon exit
+    # with a DNS failure before it even prints the login link).
+    # Isolation instead = ZERO published ports for the daemons: the
+    # unauthenticated REST/WS API is reachable only by containers attached to
+    # this network and by the Docker host through the bridge interface — never
+    # published to the outside. Lavalink's 2333 is the only host port.
+    # If your threat model requires host-side isolation too, restrict the
+    # daemon API with a firewall or run the daemons on a dedicated Docker
+    # network and bind server.address to their bridge IP.
+
+volumes:
+  fifos:
+  config-1:
+  config-2:

@@ -2,8 +2,10 @@
 #
 # Triggered by a push of any `v*` tag (e.g. `v1.0.0`). The tag name version
 # (tag minus the leading `v`) must match the project version in
-# build.gradle.kts (1.0.0) — the jar name is derived from the tag, so a
-# mismatched tag fails loudly when the expected jar is missing.
+# build.gradle.kts (1.0.0). Gradle's jar name is derived from the tag, so a
+# mismatched tag fails loudly when the expected jar is missing. The published
+# asset adds the triggering commit's short SHA as SemVer-style build metadata:
+# `lavalink-go-librespot-1.0.0+abc1234.jar`.
 #
 # ACTION PINNING POLICY: major-version tags (@v4/@v2) are used throughout,
 # matching .github/workflows/ci.yml. For a hardened repository GitHub
@@ -21,7 +23,8 @@
 #   1. REPRODUCIBILITY: two `clean build --no-build-cache` runs must produce
 #      byte-identical jar SHA-256 (ReleaseArtifactTest additionally pins the
 #      two zip-level preconditions: constant entry timestamps + sorted order).
-#   2. CHECKSUM: SHA256SUMS is generated with sha256sum over the final jar.
+#   2. CHECKSUM: SHA256SUMS is generated with sha256sum over the final,
+#      commit-qualified jar name.
 #   3. SBOM: `./gradlew cyclonedxBom` (plugin org.cyclonedx.bom 2.4.1,
 #      configured in build.gradle.kts — invoked, never reconfigured here)
 #      emits build/reports/bom.json + build/reports/bom.xml, both published.
@@ -31,8 +34,8 @@
 #      in ReleaseArtifactTest (no third-party entries) — not by this SBOM.
 #   4. ATTESTATION: actions/attest-build-provenance@v2 attaches Sigstore
 #      provenance to the jar.
-#   5. PUBLISH: jar + SHA256SUMS + both SBOM files become GitHub Release
-#      assets. NO Maven Central publication, no secrets, no
+#   5. PUBLISH: commit-qualified jar + SHA256SUMS + both SBOM files become
+#      GitHub Release assets. NO Maven Central publication, no secrets, no
 #      pull_request_target.
 #
 # Least privilege: the workflow default is contents: read; contents: write
@@ -89,15 +92,19 @@ jobs:
             exit 1
           fi
 
-      - name: Derive release jar name from tag
+      - name: Derive build and release jar names
         # Tag version (v1.0.0 -> 1.0.0) must match project.version in
-        # build.gradle.kts; a mismatch fails at the checksum step below
-        # because the expected jar does not exist.
+        # build.gradle.kts. Gradle keeps the stable internal version; only the
+        # published asset name gains +<7-character commit SHA>.
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          echo "JAR_NAME=lavalink-go-librespot-${version}.jar" >> "$GITHUB_ENV"
-          echo "Release version: $version -> $JAR_NAME"
+          commit_hash="${GITHUB_SHA:0:7}"
+          build_jar_name="lavalink-go-librespot-${version}.jar"
+          release_jar_name="lavalink-go-librespot-${version}+${commit_hash}.jar"
+          echo "BUILD_JAR_NAME=${build_jar_name}" >> "$GITHUB_ENV"
+          echo "RELEASE_JAR_NAME=${release_jar_name}" >> "$GITHUB_ENV"
+          echo "Release asset: ${build_jar_name} -> ${release_jar_name}"
 
       - name: Clean build #1 (release-artifact suite runs here)
         # --no-build-cache: the reproducibility comparison below must
@@ -108,7 +115,7 @@ jobs:
       - name: Record jar checksum (build #1)
         shell: bash
         run: |
-          jar="build/libs/${JAR_NAME}"
+          jar="build/libs/${BUILD_JAR_NAME}"
           if [ ! -f "$jar" ]; then
             echo "::error::expected release jar $jar does not exist (tag/version mismatch?)"
             exit 1
@@ -123,7 +130,7 @@ jobs:
       - name: Assert reproducible jar (build #2 sha256 == build #1)
         shell: bash
         run: |
-          jar="build/libs/${JAR_NAME}"
+          jar="build/libs/${BUILD_JAR_NAME}"
           sha256sum "$jar" | tee /tmp/release-jar-sha-2.txt
           sha1=$(cut -d' ' -f1 /tmp/release-jar-sha-1.txt)
           sha2=$(cut -d' ' -f1 /tmp/release-jar-sha-2.txt)
@@ -134,13 +141,15 @@ jobs:
             exit 1
           fi
           echo "Reproducible: both clean builds produced byte-identical jar"
-          # Publish the build-#2 artifact (byte-identical to #1 by now).
+          # Keep the verified build for diagnostics and create the public asset
+          # name from the byte-identical second build.
           cp "$jar" /tmp/release-jar-2.jar
+          cp "$jar" "build/libs/${RELEASE_JAR_NAME}"
 
       - name: Generate SHA256SUMS
         shell: bash
         run: |
-          (cd build/libs && sha256sum "${JAR_NAME}") > SHA256SUMS
+          (cd build/libs && sha256sum "${RELEASE_JAR_NAME}") > SHA256SUMS
           echo "--- SHA256SUMS ---"
           cat SHA256SUMS
 
@@ -174,13 +183,13 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: build/libs/${{ env.JAR_NAME }}
+          subject-path: build/libs/${{ env.RELEASE_JAR_NAME }}
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/libs/${{ env.JAR_NAME }}
+            build/libs/${{ env.RELEASE_JAR_NAME }}
             SHA256SUMS
             build/reports/bom.json
             build/reports/bom.xml

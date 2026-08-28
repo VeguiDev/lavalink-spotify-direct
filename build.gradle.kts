@@ -94,7 +94,7 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("org.assertj:assertj-core:3.26.3")
-    testImplementation("org.awaitility:awaitility:4.2.2")
+    testImplementation("org.awaitility:awaitility:4.3.0")
     // T5 deviation: lavaplayer is exposed to MAIN code via plugin-api's
     // compileOnly api() exposure, but compileOnly is NOT on the test compile
     // classpath — tests that assert on AudioTrackInfo need this test-scope

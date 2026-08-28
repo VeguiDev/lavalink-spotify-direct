@@ -213,22 +213,38 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     CompletableFuture<Result> future = new CompletableFuture<>();
     try {
       lane.execute(() -> {
+        ActivationBarrier sessionBarrier = null;
         try {
           if (machine.state() != MachineState.READY || lease != null
               || (barrier != null && barrier.state() == ActivationBarrier.State.PENDING)) {
             future.complete(Result.failed("backend not ready for a new track"));
             return;
           }
+          // P2: publish the session barrier synchronously at session creation —
+          // BEFORE the (potentially blocking) lease acquire — so a concurrently
+          // starting process() can never await the previous session's retained
+          // barrier (instant-fail on a FAILED one, stale pre-switch PCM on a
+          // SATISFIED one). The activation sequence reuses this same barrier.
+          sessionBarrier = new ActivationBarrier(machine.generation(), uri);
+          this.barrier = sessionBarrier;
           Optional<Lease> acquired = acquireMatching(tuning.poolAcquireTimeout());
           if (acquired.isEmpty()) {
+            sessionBarrier.fail(ActivationException.Kind.FAILED,
+                "no backend lease available within " + tuning.poolAcquireTimeout());
             future.complete(Result.failed("no backend lease available within " + tuning.poolAcquireTimeout()));
             return;
           }
-          future.complete(activateInternal(acquired.get(), uri, positionMs, false));
+          future.complete(activateInternal(acquired.get(), uri, positionMs, false, sessionBarrier));
         } catch (InterruptedException e) {
           Thread.currentThread().interrupt();
+          if (sessionBarrier != null) {
+            sessionBarrier.fail(ActivationException.Kind.CANCELED, "start interrupted");
+          }
           future.complete(Result.failed("start interrupted"));
         } catch (Throwable t) {
+          if (sessionBarrier != null) {
+            sessionBarrier.fail(ActivationException.Kind.FAILED, "start failed");
+          }
           future.complete(Result.failed("start failed: " + sanitize(String.valueOf(t))));
         }
       });
@@ -249,14 +265,23 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     CompletableFuture<Result> future = new CompletableFuture<>();
     try {
       lane.execute(() -> {
+        ActivationBarrier sessionBarrier = null;
         try {
           Lease held = lease;
           if (held == null || !machineTouched || machine.state() != MachineState.LEASED) {
             future.complete(Result.failed("no held lease; cannot replace"));
             return;
           }
-          future.complete(activateInternal(held, uri, positionMs, true));
+          // P2: publish the replacing session's barrier synchronously at session
+          // creation so the replacing track's process() can never read the
+          // previous track's retained barrier (stale pre-switch PCM).
+          sessionBarrier = new ActivationBarrier(machine.generation() + 1, uri);
+          this.barrier = sessionBarrier;
+          future.complete(activateInternal(held, uri, positionMs, true, sessionBarrier));
         } catch (Throwable t) {
+          if (sessionBarrier != null) {
+            sessionBarrier.fail(ActivationException.Kind.FAILED, "replace failed");
+          }
           future.complete(Result.failed("replace failed: " + sanitize(String.valueOf(t))));
         }
       });
@@ -396,7 +421,8 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
    * reader are reused — only the play is re-issued and a fresh barrier awaited.
    * On any failure the barrier fails typed and the lease is returned exactly once.
    */
-  private Result activateInternal(Lease lease, String uri, long positionMs, boolean replacement) {
+  private Result activateInternal(Lease lease, String uri, long positionMs, boolean replacement,
+                                  ActivationBarrier b) {
     this.lease = lease;
     this.machineTouched = replacement;
     this.sessionUri = uri;
@@ -404,11 +430,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     this.reissueFired = false;
     this.completed = false;
     this.decoder = new PcmDecoder(); // clear the partial-frame remainder at the track boundary
-    long generation = machine.state() == MachineState.LEASED
-        ? machine.generation() + 1 // replacement: the machine bumps internally
-        : lease.generation();
-    ActivationBarrier b = new ActivationBarrier(generation, uri);
-    this.barrier = b;
+    this.barrier = b; // published synchronously at session creation (P2); reused here
 
     try {
       FifoOpenerSeam.OpenHandleLike handle = null;
@@ -474,7 +496,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     if (result.isOk()) {
       b.markActivated();
       log("activated '" + b.expectedUri() + "' on backend '" + handle.getBackendId()
-          + "' (generation " + b.generation() + ")");
+          + "' (generation " + machine.generation() + ")");
     } else {
       b.fail(kindOf(result), result.reason());
     }
@@ -624,7 +646,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
       return;
     }
     ActivationBarrier b = barrier;
-    if (b == null || b.isSatisfied() || b.isFailed()) {
+    if (!reloadEligible(b)) {
       return;
     }
     String uri = uriOf(event);
@@ -639,10 +661,17 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
         return;
       }
       ActivationBarrier current = barrier;
-      if (current == null || current.isSatisfied() || current.isFailed()) {
-        return; // the real playing confirmed within the grace — nothing to reload
+      // P1: the reload must key on the MACHINE's committed playing state, not on
+      // barrier.isSatisfied(): the machine reaches PLAYING at the playing event
+      // while its /status reconcile (which satisfies the barrier) can lag by the
+      // full reconcileTimeoutMs. A reload fired in that window re-issues the
+      // same play and its re-emitted not_playing lands in PLAYING → COMPLETING →
+      // status mismatch → process-permanent DEGRADE of a healthy backend.
+      if (!reloadEligible(current)) {
+        return; // playing confirmed (or the machine moved on) — nothing to reload
       }
       log("re-issuing play (idempotent reload) for '" + current.expectedUri() + "'");
+      machine.noteActivationReload(); // arm the machine's reload-echo tolerance
       rest.playAsync(sessionUri, sessionPositionMs, false)
           .whenComplete((r, ex) -> {
             if (ex != null) {
@@ -650,6 +679,18 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
             }
           });
     }, STALE_ADVANCE_REISSUE_DELAY_MS, TimeUnit.MILLISECONDS);
+  }
+
+  /**
+   * The stale-advance reload may fire only while the machine still awaits the
+   * current activation's {@code playing} confirmation ({@code LEASED} +
+   * {@code ACTIVATING}) — once the machine has committed to PLAYING (or moved
+   * on) there is nothing to reload.
+   */
+  private boolean reloadEligible(ActivationBarrier b) {
+    return b != null && !b.isSatisfied() && !b.isFailed()
+        && machine.state() == MachineState.LEASED
+        && machine.phase() == BackendStateMachine.Phase.ACTIVATING;
   }
 
   private static String uriOf(PlayerEvent event) {

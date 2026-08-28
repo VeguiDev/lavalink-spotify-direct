@@ -234,9 +234,38 @@ public final class GoLibrespotConfig {
         List<BackendConfig> result = new ArrayList<>(list.size());
         for (int i = 0; i < list.size(); i++) {
             Map<String, Object> backendMap = asStringMap(list.get(i), "backends[" + i + "]");
+            normalizeBackendUrls(backendMap);
             result.add(BackendConfig.from(backendMap, "backends[" + i + "]"));
         }
         return result;
+    }
+
+    /**
+     * F5: normalizes trailing slashes on {@code restBaseUrl} (and an explicitly
+     * configured {@code wsUrl}) at config parse time. A base ending in {@code /}
+     * or {@code //} would otherwise produce double-slash request paths
+     * ({@code http://host:port//player/play}) → 404 → spurious quarantine.
+     */
+    private static void normalizeBackendUrls(Map<String, Object> backendMap) {
+        if (backendMap == null) {
+            return;
+        }
+        Object rest = backendMap.get("restBaseUrl");
+        if (rest instanceof String s) {
+            backendMap.put("restBaseUrl", stripTrailingSlashes(s));
+        }
+        Object ws = backendMap.get("wsUrl");
+        if (ws instanceof String s) {
+            backendMap.put("wsUrl", stripTrailingSlashes(s));
+        }
+    }
+
+    private static String stripTrailingSlashes(String url) {
+        int end = url.length();
+        while (end > 0 && url.charAt(end - 1) == '/') {
+            end--;
+        }
+        return end == url.length() ? url : url.substring(0, end);
     }
 
     static void rejectUnknownKeys(Map<String, Object> map, Set<String> knownKeys) {

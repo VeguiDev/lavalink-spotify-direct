@@ -249,6 +249,11 @@ public final class BackendStateMachine implements AutoCloseable {
   private volatile long expectedSeekPosition;
   private volatile boolean closed;
   private CompletableFuture<Result> pending;
+  /** F4: a pause queued while the machine was ACTIVATING, applied on activation confirm. */
+  private CompletableFuture<Result> queuedPause;
+  /** P1: armed by the coordinator before an idempotent reload; the reload's echo is tolerated. */
+  private volatile boolean activationReloadArmed;
+  private volatile long activationReloadGeneration;
 
   // ------------------------------------------------------------ construction
 
@@ -510,6 +515,12 @@ public final class BackendStateMachine implements AutoCloseable {
   // ------------------------------------------------------------ commands (on the lane)
 
   private void startActivation(Lease lease, String uri, long positionMs, CompletableFuture<Result> f) {
+    CompletableFuture<Result> stalePause = queuedPause;
+    queuedPause = null;
+    if (stalePause != null) {
+      stalePause.complete(Result.failed("activation superseded"));
+    }
+    activationReloadArmed = false; // a fresh activation has no reload in flight
     switch (state) {
       case DEAD -> {
         f.complete(Result.dead("machine dead"));
@@ -534,6 +545,15 @@ public final class BackendStateMachine implements AutoCloseable {
         if (!lease.backend().getBackendId().equals(handle.getBackendId())) {
           f.complete(Result.failed("lease belongs to backend '"
               + lease.backend().getBackendId() + "', machine is '" + handle.getBackendId() + "'"));
+          return;
+        }
+        // P3: adopt the lease only when it is still the pool's CURRENT active
+        // lease — a replace-vs-natural-completion interleaving can otherwise
+        // adopt an already-released lease the pool has re-granted to another
+        // session (two sessions on one daemon). isActive() verifies the pool's
+        // (state, generation, leaseId) tuple still names this lease.
+        if (!lease.isActive()) {
+          f.complete(Result.failed("lease is no longer active; stale adoption rejected"));
           return;
         }
         this.lease = lease;
@@ -566,30 +586,62 @@ public final class BackendStateMachine implements AutoCloseable {
   }
 
   private void startPause(CompletableFuture<Result> f) {
-    if (!requireLeased(f) || !requireIdleCommand(f)) {
+    if (!requireLeased(f)) {
+      return;
+    }
+    // F4: a pause requested while activation is in flight cannot be issued yet
+    // (the daemon has no playing session) and must not be silently dropped —
+    // the daemon would keep playing while the player is paused. Queue it and
+    // apply it the moment the activation confirms.
+    if (phase == Phase.ACTIVATING) {
+      if (queuedPause != null) {
+        f.complete(Result.failed("pause already queued during activation"));
+        return;
+      }
+      queuedPause = f;
+      return;
+    }
+    if (!requireIdleCommand(f)) {
       return;
     }
     switch (phase) {
-      case PLAYING -> {
-        phase = Phase.PAUSING;
-        pending = f;
-        rest.pauseAsync().whenComplete((r, ex) -> submit(() -> handlePauseResponse(r, unwrapRest(ex))));
-        scheduleTimeout(f, timing.pauseAckTimeoutMs(), Phase.PAUSING, () -> {
-          reconcile(ReconcileKind.PAUSED, expectedUri, -1, reconcileDeadline(), outcome -> {
-            if (pending == f) { // the paused event did not already confirm
-              if (outcome == ReconcileOutcome.OK) {
-                phase = Phase.PAUSE_CONFIRMED;
-                completePending(Result.ok("paused (status)"));
-              } else {
-                fail("pause ack timeout (" + outcome + ")", false, outcome == ReconcileOutcome.UNREACHABLE);
-              }
-            }
-          });
-        });
-      }
+      case PLAYING -> issuePause(f);
       case PAUSE_CONFIRMED -> f.complete(Result.ok("already paused"));
       default -> f.complete(Result.failed("cannot pause from " + phase));
     }
+  }
+
+  /** Issues the remote pause and awaits the matching {@code paused} event (or a paused /status). */
+  private void issuePause(CompletableFuture<Result> f) {
+    phase = Phase.PAUSING;
+    pending = f;
+    rest.pauseAsync().whenComplete((r, ex) -> submit(() -> handlePauseResponse(r, unwrapRest(ex))));
+    scheduleTimeout(f, timing.pauseAckTimeoutMs(), Phase.PAUSING, () -> {
+      reconcile(ReconcileKind.PAUSED, expectedUri, -1, reconcileDeadline(), outcome -> {
+        if (pending == f) { // the paused event did not already confirm
+          if (outcome == ReconcileOutcome.OK) {
+            phase = Phase.PAUSE_CONFIRMED;
+            completePending(Result.ok("paused (status)"));
+          } else {
+            fail("pause ack timeout (" + outcome + ")", false, outcome == ReconcileOutcome.UNREACHABLE);
+          }
+        }
+      });
+    });
+  }
+
+  /** F4: applies a pause queued while the machine was ACTIVATING. Runs on the lane. */
+  private void applyQueuedPause() {
+    CompletableFuture<Result> queued = queuedPause;
+    queuedPause = null;
+    if (queued == null) {
+      return;
+    }
+    if (phase != Phase.PLAYING || pending != null) {
+      queued.complete(Result.failed("cannot pause from " + phase));
+      return;
+    }
+    issuePause(queued);
   }
 
   private void handlePauseResponse(PlayerCommandResult r, RestException ex) {
@@ -778,6 +830,7 @@ public final class BackendStateMachine implements AutoCloseable {
         reconcile(ReconcileKind.PLAYING, expectedUri, -1, reconcileDeadline(), outcome -> {
           if (outcome == ReconcileOutcome.OK) {
             completePending(Result.ok("activated: " + expectedUri));
+            applyQueuedPause(); // F4: a pause queued during activation applies now
           } else {
             fail("status contradicts playing event (" + outcome + ")", true,
                 outcome == ReconcileOutcome.UNREACHABLE);
@@ -817,15 +870,11 @@ public final class BackendStateMachine implements AutoCloseable {
     }
     switch (phase) {
       case PLAYING -> {
-        phase = Phase.COMPLETING;
-        reconcile(ReconcileKind.IDLE, expectedUri, -1, reconcileDeadline(), outcome -> {
-          if (outcome == ReconcileOutcome.OK) {
-            releaseToReady("natural completion");
-          } else {
-            fail("completion status mismatch (" + outcome + ")", true,
-                outcome == ReconcileOutcome.UNREACHABLE);
-          }
-        });
+        if (activationReloadArmed && activationReloadGeneration == generation.get()) {
+          probeReloadEcho();
+        } else {
+          startCompletionReconcile();
+        }
       }
       case ACTIVATING -> ignoredEvents.incrementAndGet(); // stale replay of the previous lease
       default -> fail("contradictory not_playing while " + phase, true, false);
@@ -863,6 +912,62 @@ public final class BackendStateMachine implements AutoCloseable {
     if (state == MachineState.LEASED) {
       fail("ws connection lost", false, false);
     }
+  }
+
+  /**
+   * P1: arms the reload-echo tolerance for the CURRENT activation. Called by
+   * the coordinator immediately before it re-issues the idempotent play
+   * (stale-advance reload); a subsequent matching {@code not_playing} that the
+   * /status reconcile finds while the daemon is still playing is that reload's
+   * echo and is tolerated by {@link #handleNotPlaying} instead of degrading.
+   * The arming is per-generation and reset on every new activation.
+   */
+  void noteActivationReload() {
+    activationReloadArmed = true;
+    activationReloadGeneration = generation.get();
+  }
+
+  /**
+   * P1: a {@code not_playing} in PLAYING while a reload is armed for the current
+   * generation may be the idempotent reload's echo — the re-issued play re-emits
+   * {@code not_playing} while the track actually keeps playing. The normal
+   * completion reconcile would only ever deliver TIMEOUT for a "still playing"
+   * daemon (MISMATCH is retried until the deadline), so probe /status once:
+   * still playing ⇒ echo (revert to PLAYING); idle ⇒ genuine completion; any
+   * ambiguous answer ⇒ fall back to the bounded completion reconcile.
+   */
+  private void probeReloadEcho() {
+    rest.statusAsync().whenComplete((status, ex) -> submit(() -> {
+      if (phase != Phase.PLAYING) {
+        return; // a command interleaved — it owns the outcome
+      }
+      if (ex != null || status == null || status.isNoSession()
+          || !status.is2xx() || status.parsed().isEmpty()) {
+        startCompletionReconcile();
+        return;
+      }
+      if (status.parsed().get().stopped()) {
+        releaseToReady("natural completion");
+      } else {
+        activationReloadArmed = false;
+        phase = Phase.PLAYING;
+        ignoredEvents.incrementAndGet();
+        log("tolerated reload-echo not_playing for '" + expectedUri + "' (daemon still playing)");
+      }
+    }));
+  }
+
+  /** The bounded completion reconcile: release on idle, DEGRADE on contradiction. */
+  private void startCompletionReconcile() {
+    phase = Phase.COMPLETING;
+    reconcile(ReconcileKind.IDLE, expectedUri, -1, reconcileDeadline(), outcome -> {
+      if (outcome == ReconcileOutcome.OK) {
+        releaseToReady("natural completion");
+      } else {
+        fail("completion status mismatch (" + outcome + ")", true,
+            outcome == ReconcileOutcome.UNREACHABLE);
+      }
+    });
   }
 
   // ------------------------------------------------------------ /status reconciliation
@@ -993,6 +1098,11 @@ public final class BackendStateMachine implements AutoCloseable {
         + " (consecutive=" + consecutiveFailures + ") -> " + decision);
     Result result = applyDecision(decision, reason, true);
     completePending(result);
+    CompletableFuture<Result> queued = queuedPause;
+    queuedPause = null;
+    if (queued != null) {
+      queued.complete(result); // resolve a pause queued during the failed activation
+    }
     return result;
   }
 
@@ -1156,6 +1266,11 @@ public final class BackendStateMachine implements AutoCloseable {
         expectedUri = null;
       }
       completePending(Result.dead("machine closed"));
+      CompletableFuture<Result> queued = queuedPause;
+      queuedPause = null;
+      if (queued != null) {
+        queued.complete(Result.dead("machine closed"));
+      }
     });
     lane.shutdown();
     try {

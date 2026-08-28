@@ -58,6 +58,8 @@ public class GoLibrespotPlugin extends PluginEventHandler {
   private static final Logger log = LoggerFactory.getLogger(GoLibrespotPlugin.class);
   private static final LogSanitizer sanitizer = LogSanitizer.defaults();
   private static final String CONFIG_PREFIX = "plugins.golibrespot";
+  private static final java.util.regex.Pattern USERINFO_PATTERN =
+      java.util.regex.Pattern.compile("(?i)(https?://)([^/@\\s]+)@");
 
   private final GoLibrespotConfig config;
   private final ConfigFactory.Runtime runtime;
@@ -82,21 +84,40 @@ public class GoLibrespotPlugin extends PluginEventHandler {
    */
   private static GoLibrespotConfig bindConfig(Environment environment) {
     Map<String, Object> raw = ConfigBinding.subtree(environment, CONFIG_PREFIX);
+    if (raw == null || raw.isEmpty()) {
+      // F6: an ABSENT plugins.golibrespot config must not abort Lavalink
+      // startup — Lavalink auto-loads every plugin JAR, so an unconfigured
+      // plugin no-ops gracefully as disabled with zero backends.
+      log.warn("plugins.golibrespot is not configured: the plugin is DISABLED "
+          + "(no backends; spdirect tracks will not load)");
+      return GoLibrespotConfig.from(Map.of("enabled", false));
+    }
     GoLibrespotConfig config;
     try {
       config = GoLibrespotConfig.from(raw);
     } catch (IllegalArgumentException e) {
       // binding errors (unknown keys / unparseable values) name the field
       throw new IllegalStateException(
-          "go-librespot configuration binding failed: " + sanitizer.sanitize(String.valueOf(e.getMessage())), e);
+          "go-librespot configuration binding failed: " + sanitizeConfigMessage(String.valueOf(e.getMessage())), e);
     }
     List<String> failures = GoLibrespotConfigValidator.validate(config);
     if (!failures.isEmpty()) {
       String joined = String.join("; ", failures);
-      log.error("go-librespot configuration is invalid: {}", sanitizer.sanitize(joined));
-      throw new IllegalStateException("go-librespot configuration is invalid: " + joined);
+      String sanitized = sanitizeConfigMessage(joined);
+      log.error("go-librespot configuration is invalid: {}", sanitized);
+      throw new IllegalStateException("go-librespot configuration is invalid: " + sanitized);
     }
     return config;
+  }
+
+  /**
+   * F3: sanitizes a config message destined for a log line or the startup-abort
+   * exception: the default {@link LogSanitizer} rules plus URI-userinfo
+   * redaction (the default credential rules do not cover {@code user:pass@host}).
+   */
+  private static String sanitizeConfigMessage(String message) {
+    String sanitized = sanitizer.sanitize(message);
+    return USERINFO_PATTERN.matcher(sanitized).replaceAll("$1***@");
   }
 
   /**

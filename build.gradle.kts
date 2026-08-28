@@ -57,6 +57,11 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("org.assertj:assertj-core:3.26.3")
     testImplementation("org.awaitility:awaitility:4.2.2")
+    // T5 deviation: lavaplayer is exposed to MAIN code via plugin-api's
+    // compileOnly api() exposure, but compileOnly is NOT on the test compile
+    // classpath — tests that assert on AudioTrackInfo need this test-scope
+    // declaration (matches the version plugin-api 4.2.2 already resolves).
+    testImplementation("dev.arbjerg:lavaplayer:2.2.6")
     // Test-only WebSocket server for the fake go-librespot daemon fixture (T6+).
     testImplementation("org.java-websocket:Java-WebSocket:1.5.7")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")

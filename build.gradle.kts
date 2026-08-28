@@ -1,3 +1,5 @@
+import org.gradle.api.attributes.Bundling
+
 plugins {
     java
     // Lavalink Gradle plugin: generates the 4.2.x plugin manifest
@@ -64,5 +66,29 @@ dependencies {
     testImplementation("dev.arbjerg:lavaplayer:2.2.6")
     // Test-only WebSocket server for the fake go-librespot daemon fixture (T6+).
     testImplementation("org.java-websocket:Java-WebSocket:1.5.7")
+    // T19 integration smoke: the real Lavalink test server. The bare GAV resolves
+    // the plain (non-boot) jar whose classes are directly classpath-loadable,
+    // plus its real transitive deps (Spring Boot 3.3.0, lavaplayer, koe, ...).
+    testImplementation("dev.arbjerg.lavalink:Lavalink-Server:4.2.2")
+    // The server POM scopes its Spring Boot deps as runtime, so the test code
+    // that boots the server in-JVM (SpringApplication / context classes) needs
+    // an explicit test-scope Boot declaration matching the server's 3.3.0.
+    testImplementation("org.springframework.boot:spring-boot:3.3.0")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+// The server's dependency graph contains dev.arbjerg:lavadsp, which publishes
+// both a normal and a shadowed variant; the test configurations must declare
+// which one to consume or Gradle cannot resolve it (T19).
+configurations {
+    testCompileClasspath {
+        attributes {
+            attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.EXTERNAL))
+        }
+    }
+    testRuntimeClasspath {
+        attributes {
+            attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.EXTERNAL))
+        }
+    }
 }

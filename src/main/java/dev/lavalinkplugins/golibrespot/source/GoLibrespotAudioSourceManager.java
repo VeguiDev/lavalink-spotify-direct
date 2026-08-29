@@ -6,6 +6,7 @@ import com.sedmelluq.discord.lavaplayer.track.AudioItem;
 import com.sedmelluq.discord.lavaplayer.track.AudioReference;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
+import com.sedmelluq.discord.lavaplayer.track.BasicAudioPlaylist;
 import dev.lavalinkplugins.golibrespot.identifier.TrackIdParser;
 import dev.lavalinkplugins.golibrespot.logging.LogSanitizer;
 import dev.lavalinkplugins.golibrespot.metadata.MetadataResolver;
@@ -15,6 +16,7 @@ import dev.lavalinkplugins.golibrespot.pool.ExclusivePool;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -26,17 +28,18 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 /**
- * The {@code spdirect} source manager — the ONLY source that claims the
- * {@code spdirect:<id>} / {@code spdirect:spotify:track:<id>} identifiers
- * (DECISIONS.md §3). Source name is exactly {@code "spdirect"}.
+ * The {@code spotify} source manager. It claims supported Spotify track and
+ * collection identifiers while preserving {@code spdirect:} as the encoded
+ * track identifier namespace. Its source name is exactly {@code "spotify"}.
  *
  * <p><b>Lease at play, never at load.</b> {@link #loadItem} resolves metadata
  * via the T10 {@link MetadataResolver} (READY backends, no lease) and returns
- * a {@link GoLibrespotAudioTrack}. Ordinary Spotify URIs/URLs, albums,
- * playlists and structurally malformed spdirect identifiers are NEVER claimed
- * ({@code null} lets Lavalink fall through to other sources); a metadata
- * failure is likewise a clear {@code null} load — duration/metadata are never
- * fabricated. The pool is only ever consulted at play time
+ * a {@link GoLibrespotAudioTrack} or collection playlist. Supported albums and
+ * playlists are claimed and surfaced as {@link BasicAudioPlaylist} instances;
+ * unrecognized or structurally malformed identifiers return {@code null} so
+ * Lavalink can fall through. A metadata failure is likewise a clear
+ * {@code null} load — duration/metadata are never fabricated. The pool is only
+ * ever consulted at play time
  * ({@link #resolvePlaybackCoordinator}), never during load.</p>
  *
  * <p><b>Shared wiring.</b> The manager holds the {@link ExclusivePool} (backend
@@ -46,20 +49,21 @@ import org.springframework.stereotype.Service;
  * cached per backend id; {@link #shutdown()} closes the factory (the production
  * factory tears down its coordinator + stop-sequence chain).</p>
  *
- * <p><b>No encoded-track format.</b> {@link #isTrackEncodable} is {@code false}
- * and {@link #encodeTrack}/{@link #decodeTrack} throw
- * {@link UnsupportedOperationException} — spdirect tracks are not persistable
- * (the daemon session is not replayable from a byte stream).</p>
+ * <p><b>Encoded-track format.</b> {@link #isTrackEncodable} accepts
+ * {@link GoLibrespotAudioTrack} instances. {@link #encodeTrack} persists the
+ * bare Spotify track id and {@link #decodeTrack} restores the wrapping track;
+ * playback still obtains a fresh daemon session at play time.</p>
  *
  * <p>{@code @Service}: Spring auto-registers this bean; Lavalink registers
  * {@code AudioSourceManager} beans before
  * {@code AudioPlayerManagerConfiguration} beans, which is exactly why this
- * source claims ONLY {@code spdirect:} identifiers and nothing else.</p>
+ * source participates in identifier claiming under the {@code spotify} source
+ * name.</p>
  */
 @Service
 public class GoLibrespotAudioSourceManager implements AudioSourceManager {
 
-  private static final String SOURCE_NAME = "spdirect";
+  private static final String SOURCE_NAME = "spotify";
   private static final String SPOTIFY_TRACK_URI_PREFIX = "spotify:track:";
 
   private final ExclusivePool pool;
@@ -99,33 +103,67 @@ public class GoLibrespotAudioSourceManager implements AudioSourceManager {
       return null;
     }
     TrackIdParser.TrackIdParseResult parsed = TrackIdParser.parse(identifier);
+    if (parsed instanceof TrackIdParser.TrackIdParseResult.CollectionId collection) {
+      return metadataResolver.resolveCollection(collection.kind(), collection.id())
+          .map(this::buildCollectionPlaylist)
+          .orElse(null);
+    }
     if (!(parsed instanceof TrackIdParser.TrackIdParseResult.TrackId trackId)) {
-      // NotClaimed (ordinary Spotify URIs/URLs, albums, playlists) or Malformed —
-      // never claimed, never an error: null lets Lavalink fall through.
       return null;
     }
-    Optional<AudioTrackInfo> resolved = metadataResolver.resolve(trackId.id());
-    if (resolved.isEmpty()) {
-      log.warn("spdirect load failed for track '{}': metadata unavailable (no lease taken, "
-          + "no duration fabricated)", sanitizer.sanitize(trackId.id()));
+    Optional<AudioTrackInfo> info = metadataResolver.resolve(trackId.id());
+    if (info.isEmpty()) {
+      log.warn("Spotify metadata unavailable for '{}'; refusing an invalid-duration track",
+          sanitizer.sanitize(trackId.id()));
       return null;
     }
-    return new GoLibrespotAudioTrack(trackId.id(), resolved.get(), this);
+    return new GoLibrespotAudioTrack(trackId.id(), info.get(), this);
+  }
+
+  private BasicAudioPlaylist buildCollectionPlaylist(MetadataResolver.CollectionMetadata metadata) {
+    List<AudioTrack> tracks = new ArrayList<>(metadata.tracks().size());
+    for (int i = 0; i < metadata.tracks().size(); i++) {
+      AudioTrackInfo info = metadata.tracks().get(i);
+      if (i == 0 && metadata.artworkUrl() != null && !metadata.artworkUrl().isBlank()) {
+        info = new AudioTrackInfo(
+            info.title,
+            info.author,
+            info.length,
+            info.identifier,
+            info.isStream,
+            info.uri,
+            metadata.artworkUrl(),
+            info.isrc);
+      }
+      tracks.add(buildCollectionTrack(info));
+    }
+    String name = metadata.author() != null && !metadata.author().isBlank()
+        ? metadata.name() + " · " + metadata.author()
+        : metadata.name();
+    return new BasicAudioPlaylist(name, List.copyOf(tracks), null, false);
+  }
+
+  private AudioTrack buildCollectionTrack(AudioTrackInfo info) {
+    return new GoLibrespotAudioTrack(
+        info.identifier.substring("spdirect:".length()), info, this);
   }
 
   @Override
   public boolean isTrackEncodable(AudioTrack track) {
-    return false;
+    return track instanceof GoLibrespotAudioTrack;
   }
 
   @Override
   public void encodeTrack(AudioTrack track, DataOutput output) throws IOException {
-    throw new UnsupportedOperationException("spdirect tracks are not encodable");
+    if (!(track instanceof GoLibrespotAudioTrack direct)) {
+      throw new IllegalArgumentException("track is not a spdirect track");
+    }
+    output.writeUTF(direct.trackId());
   }
 
   @Override
   public AudioTrack decodeTrack(AudioTrackInfo trackInfo, DataInput input) throws IOException {
-    throw new UnsupportedOperationException("spdirect tracks are not encodable");
+    return new GoLibrespotAudioTrack(input.readUTF(), trackInfo, this);
   }
 
   /**
@@ -135,7 +173,7 @@ public class GoLibrespotAudioSourceManager implements AudioSourceManager {
   @Override
   public void shutdown() {
     if (shutDown.compareAndSet(false, true)) {
-      log.info("spdirect source manager shutting down: closing coordinator factory");
+      log.info("spotify source manager shutting down: closing coordinator factory");
       try {
         coordinatorFactory.close();
       } catch (RuntimeException e) {

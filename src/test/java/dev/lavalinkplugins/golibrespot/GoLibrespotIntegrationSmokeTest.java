@@ -51,7 +51,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *
  * <ul>
  *   <li>the plugin bean loads and the config binds from {@code plugins.golibrespot};</li>
- *   <li>{@code GET /v4/info} lists the {@code spdirect} source manager and the
+ *   <li>{@code GET /v4/info} lists the {@code spotify} source manager and the
  *       {@code golibrespot} plugin;</li>
  *   <li>loading {@code spdirect:<id>} through the real server's
  *       {@code AudioPlayerManager} (the exact load pipeline the REST endpoint
@@ -67,14 +67,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * </ul>
  *
  * <p><b>Why the HTTP load is proven through the manager, not
- * {@code /v4/loadtracks}:</b> the server's {@code UtilKt.toTrack} encodes
- * every track in a load response ({@code AudioPlayerManager.encodeTrack} →
- * {@code GoLibrespotAudioSourceManager.encodeTrack}), and spdirect tracks are
- * deliberately <em>non-encodable</em> (T18 contract: the daemon session is not
- * replayable from a byte stream), so a direct HTTP load of an spdirect track
- * returns HTTP 500 here by design. The manager-level load exercises the real
- * plugin pipeline (identifier claim → lease-free metadata via the fake daemon
- * → {@code GoLibrespotAudioTrack}) end to end.</p>
+ * {@code /v4/loadtracks}:</b> {@code GoLibrespotAudioSourceManager.encodeTrack}
+ * and {@code isTrackEncodable} ARE implemented for the {@code spdirect:}
+ * identifier form, so a track is encodable into a load response. The
+ * manager-level load is used because it exercises the real plugin pipeline
+ * (identifier claim → lease-free metadata via the fake daemon →
+ * {@code GoLibrespotAudioTrack}) end to end without depending on the REST
+ * layer.</p>
  *
  * <p><b>What this smoke does NOT prove:</b> it does not play audio (no FIFO,
  * no lease, no daemon playback) — the daemon REST/WS command lanes, activation
@@ -169,14 +168,14 @@ class GoLibrespotIntegrationSmokeTest {
 
     assertThat(asList(info.get("sourceManagers")))
         .as("the plugin's source manager must be registered with the AudioPlayerManager")
-        .contains("spdirect");
+        .contains("spotify");
     List<Object> plugins = asList(info.get("plugins"));
     assertThat(plugins)
         .as("the golibrespot plugin descriptor must be reported")
         .anySatisfy(p -> {
           Map<String, Object> plugin = asMap(p);
           assertThat(asString(plugin.get("name"))).isEqualTo("golibrespot");
-          assertThat(asString(plugin.get("version"))).isEqualTo("1.0.0");
+          assertThat(asString(plugin.get("version"))).isEqualTo("1.2.2");
         });
 
     // The bean is the AudioSourceManager Lavalink registered.
@@ -204,13 +203,13 @@ class GoLibrespotIntegrationSmokeTest {
 
   @Test
   @Timeout(120)
-  void ordinarySpotifyUriFallsThroughUnclaimed() throws Exception {
+  void ordinarySpotifyUriIsClaimedBySpdirect() throws Exception {
     Map<String, Object> load = getJson("/v4/loadtracks?identifier="
         + urlEncode("spotify:track:" + TRACK_ID));
-    assertThat(asString(load.get("loadType"))).isEqualTo("empty");
+    assertThat(asString(load.get("loadType"))).isEqualTo("track");
 
     assertThat(loadSync(serverContext.getBean(AudioPlayerManager.class), "spotify:track:" + TRACK_ID))
-        .isNull();
+        .isInstanceOf(GoLibrespotAudioTrack.class);
   }
 
   private static AudioTrack loadSync(AudioPlayerManager manager, String identifier) throws Exception {

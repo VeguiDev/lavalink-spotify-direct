@@ -3,7 +3,9 @@ package dev.lavalinkplugins.golibrespot.source;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.sedmelluq.discord.lavaplayer.track.AudioPlaylist;
 import com.sedmelluq.discord.lavaplayer.track.AudioReference;
+import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
 import dev.lavalinkplugins.golibrespot.config.GoLibrespotConfig;
 import dev.lavalinkplugins.golibrespot.lifecycle.BackendStateMachine;
@@ -13,41 +15,48 @@ import dev.lavalinkplugins.golibrespot.metadata.MetadataResolver.ReadyBackendSel
 import dev.lavalinkplugins.golibrespot.pool.BackendState;
 import dev.lavalinkplugins.golibrespot.pool.ExclusivePool;
 import dev.lavalinkplugins.golibrespot.testfixtures.FakeLibrespotDaemon;
+import dev.lavalinkplugins.golibrespot.testfixtures.FakeSpotifyWebApi;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Contract + acceptance tests for {@link GoLibrespotAudioSourceManager} (T18).
  *
- * <p>loadItem claims EXACTLY the spdirect namespace (bare {@code spdirect:<id>}
- * and {@code spdirect:spotify:track:<id>}), resolving metadata lease-free via
- * the T10 {@link MetadataResolver} against the scripted {@link FakeLibrespotDaemon}
- * {@code /web-api} passthrough. Everything else — ordinary Spotify URIs/URLs,
- * albums/playlists, and structurally malformed spdirect input — returns
- * {@code null} so Lavalink falls through to other sources, and NEVER issues a
- * REST command beyond the metadata fetch. A metadata failure (empty Optional)
- * is a clear load failure (null) — duration/metadata are never fabricated.</p>
+ * <p>loadItem claims Spotify track and collection identifiers, resolving
+ * metadata lease-free through the direct Spotify Web API when credentials are
+ * configured and otherwise through the scripted {@link FakeLibrespotDaemon}
+ * {@code /web-api} passthrough. Structurally malformed input returns
+ * {@code null}; metadata failures are never replaced with fabricated data.</p>
  *
  * <p>The pool is only ever present; loadItem must NOT acquire a lease or touch
  * the daemon beyond {@code GET /web-api/v1/tracks/{id}} (asserted via the
- * fixture's recorded commands + pool state). encode/decode are unsupported
- * (isTrackEncodable false, UnsupportedOperationException), getSourceName is
- * {@code spdirect}, and shutdown closes the coordinator factory.</p>
+ * fixture's recorded commands + pool state). Tracks are encodable, the source
+ * name is {@code spotify}, and shutdown closes the coordinator factory.</p>
  */
 @Timeout(value = 60, unit = TimeUnit.SECONDS)
 class GoLibrespotAudioSourceManagerTest {
 
   private static final String TRACK_ID = "4iV5W9uYEdYUVa79Axb7Rh";
   private static final String TRACK_ID_B = "0jv2SxQk2Tz29TlCVODMW7";
+  private static final String PLAYLIST_ID = "37i9dQZF1DXcBWIGoYBM5M";
+  private static final String PLAYLIST_PATH = "/v1/playlists/" + PLAYLIST_ID;
+  private static final String DAEMON_PLAYLIST_PATH = "/web-api/v1/playlists/" + PLAYLIST_ID;
+  private static final String PLAYLIST_ARTWORK = "https://i.scdn.co/image/playlist-cover";
+  private static final String TRACK_ARTWORK = "https://i.scdn.co/image/track-cover";
 
   private final List<Rig> rigs = new ArrayList<>();
 
@@ -62,9 +71,9 @@ class GoLibrespotAudioSourceManagerTest {
   // ---------------------------------------------------------------- claiming
 
   @Test
-  void getSourceNameIsSpdirect() {
+  void getSourceNameIsSpotify() {
     try (Rig rig = newRig()) {
-      assertThat(rig.manager.getSourceName()).isEqualTo("spdirect");
+      assertThat(rig.manager.getSourceName()).isEqualTo("spotify");
     }
   }
 
@@ -111,36 +120,67 @@ class GoLibrespotAudioSourceManagerTest {
   // ---------------------------------------------------------------- non-claiming
 
   @Test
-  void loadItemReturnsNullForPlainSpotifyTrackUri() {
+  void loadItemClaimsPlainSpotifyTrackUri() {
     try (Rig rig = newRig()) {
+      rig.daemon.webApi(FakeLibrespotDaemon.Response.ok(webApiTrackJson(TRACK_ID, 252_000L)));
       Object item = rig.manager.loadItem(
           null, new AudioReference("spotify:track:" + TRACK_ID, null));
 
-      assertThat(item).isNull();
-      assertThat(rig.daemon.getReceivedCommands()).isEmpty();
+      assertThat(item).isInstanceOf(GoLibrespotAudioTrack.class);
     }
   }
 
   @Test
-  void loadItemReturnsNullForOpenSpotifyTrackUrl() {
+  void loadItemClaimsOpenSpotifyTrackUrl() {
     try (Rig rig = newRig()) {
+      rig.daemon.webApi(FakeLibrespotDaemon.Response.ok(webApiTrackJson(TRACK_ID, 252_000L)));
       Object item = rig.manager.loadItem(
-          null, new AudioReference("https://open.spotify.com/track/" + TRACK_ID, null));
+          null, new AudioReference("https://open.spotify.com/intl-es/track/" + TRACK_ID + "?si=abc", null));
 
-      assertThat(item).isNull();
-      assertThat(rig.daemon.getReceivedCommands()).isEmpty();
+      assertThat(item).isInstanceOf(GoLibrespotAudioTrack.class);
     }
   }
 
   @Test
-  void loadItemReturnsNullForAlbumAndPlaylistUris() {
+  void loadItemReturnsNullForCollectionsWhenDaemonMetadataIsUnavailable() {
     try (Rig rig = newRig()) {
+      rig.daemon.scriptGet(
+          "/web-api/v1/albums/aaaaaaaaaaaaaaaaaaaaaa", FakeLibrespotDaemon.Response.error(404));
+      rig.daemon.scriptGet(
+          "/web-api/v1/playlists/aaaaaaaaaaaaaaaaaaaaaa", FakeLibrespotDaemon.Response.error(404));
+
       assertThat(rig.manager.loadItem(null, new AudioReference("spotify:album:aaaaaaaaaaaaaaaaaaaaaa", null)))
           .isNull();
       assertThat(rig.manager.loadItem(null, new AudioReference("spotify:playlist:aaaaaaaaaaaaaaaaaaaaaa", null)))
           .isNull();
       assertThat(rig.manager.loadItem(null, new AudioReference("spdirect:spotify:album:aaaaaaaaaaaaaaaaaaaaaa", null)))
           .isNull();
+      assertThat(rig.daemon.getReceivedCommands())
+          .extracting(FakeLibrespotDaemon.RecordedCommand::path)
+          .containsExactly(
+              "/web-api/v1/albums/aaaaaaaaaaaaaaaaaaaaaa",
+              "/web-api/v1/playlists/aaaaaaaaaaaaaaaaaaaaaa");
+    }
+  }
+
+  @Test
+  void loadItemSurfacesDirectPlaylistMetadataWithoutTouchingDaemon() {
+    try (Rig rig = newDirectApiRig()) {
+      rig.spotify.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.ok(playlistJson()));
+      rig.daemon.scriptGet(DAEMON_PLAYLIST_PATH, FakeLibrespotDaemon.Response.error(429));
+
+      Object item = rig.manager.loadItem(
+          null, new AudioReference("spotify:playlist:" + PLAYLIST_ID, null));
+
+      assertThat(item).isInstanceOf(AudioPlaylist.class);
+      AudioPlaylist playlist = (AudioPlaylist) item;
+      assertThat(playlist.getName()).isEqualTo("Name · Author");
+      assertThat(playlist.getTracks()).hasSize(2);
+      assertThat(playlist.getTracks().get(0).getInfo().artworkUrl).isEqualTo(PLAYLIST_ARTWORK);
+      assertThat(playlist.getTracks().get(1).getInfo().artworkUrl).isEqualTo(TRACK_ARTWORK);
+      assertThat(playlist.getTracks())
+          .extracting(track -> track.getInfo().identifier)
+          .containsExactly("spdirect:" + TRACK_ID, "spdirect:" + TRACK_ID_B);
       assertThat(rig.daemon.getReceivedCommands()).isEmpty();
     }
   }
@@ -169,7 +209,7 @@ class GoLibrespotAudioSourceManagerTest {
   // ---------------------------------------------------------------- metadata failure
 
   @Test
-  void loadItemReturnsNullWhenMetadataUnavailableWithoutFabricatingDuration() {
+  void loadItemRejectsTrackWhenMetadataUnavailable() {
     try (Rig rig = newRig()) {
       // daemon has no session → 204 no-session → resolver empty → clear null load
       rig.daemon.webApi(FakeLibrespotDaemon.Response.noContent());
@@ -185,34 +225,30 @@ class GoLibrespotAudioSourceManagerTest {
   // ---------------------------------------------------------------- encode/decode
 
   @Test
-  void tracksAreNotEncodable() {
+  void tracksAreEncodable() {
     try (Rig rig = newRig()) {
       rig.daemon.webApi(FakeLibrespotDaemon.Response.ok(webApiTrackJson(TRACK_ID, 3_040_000L)));
       GoLibrespotAudioTrack track = (GoLibrespotAudioTrack) rig.manager.loadItem(
           null, new AudioReference("spdirect:" + TRACK_ID, null));
 
       assertThat(track).isNotNull();
-      assertThat(rig.manager.isTrackEncodable(track)).isFalse();
+      assertThat(rig.manager.isTrackEncodable(track)).isTrue();
     }
   }
 
   @Test
-  void encodeTrackThrowsUnsupportedOperationException() {
+  void encodedTrackRoundTrips() throws Exception {
     try (Rig rig = newRig()) {
       rig.daemon.webApi(FakeLibrespotDaemon.Response.ok(webApiTrackJson(TRACK_ID, 3_040_000L)));
       GoLibrespotAudioTrack track = (GoLibrespotAudioTrack) rig.manager.loadItem(
           null, new AudioReference("spdirect:" + TRACK_ID, null));
 
-      assertThatThrownBy(() -> rig.manager.encodeTrack(track, null))
-          .isInstanceOf(UnsupportedOperationException.class);
-    }
-  }
-
-  @Test
-  void decodeTrackThrowsUnsupportedOperationException() {
-    try (Rig rig = newRig()) {
-      assertThatThrownBy(() -> rig.manager.decodeTrack(null, null))
-          .isInstanceOf(UnsupportedOperationException.class);
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      rig.manager.encodeTrack(track, new DataOutputStream(bytes));
+      AudioTrack decoded = rig.manager.decodeTrack(
+          track.getInfo(), new DataInputStream(new ByteArrayInputStream(bytes.toByteArray())));
+      assertThat(decoded).isInstanceOf(GoLibrespotAudioTrack.class);
+      assertThat(((GoLibrespotAudioTrack) decoded).trackId()).isEqualTo(TRACK_ID);
     }
   }
 
@@ -253,7 +289,15 @@ class GoLibrespotAudioSourceManagerTest {
   // ---------------------------------------------------------------- rig
 
   private Rig newRig() {
-    Rig rig = new Rig();
+    return newRig(false);
+  }
+
+  private Rig newDirectApiRig() {
+    return newRig(true);
+  }
+
+  private Rig newRig(boolean directApi) {
+    Rig rig = new Rig(directApi);
     rig.start();
     rigs.add(rig);
     return rig;
@@ -269,6 +313,21 @@ class GoLibrespotAudioSourceManagerTest {
         + "\"id\":" + FakeLibrespotDaemon.jsonString(id) + "}";
   }
 
+  private static String playlistJson() {
+    String first = FakeSpotifyWebApi.trackObjectJson(
+        TRACK_ID, "First", "Collection Artist", "Collection Album",
+        TRACK_ARTWORK, 180_000L, "USRC10000001");
+    String second = FakeSpotifyWebApi.trackObjectJson(
+        TRACK_ID_B, "Second", "Collection Artist", "Collection Album",
+        TRACK_ARTWORK, 181_000L, "USRC10000002");
+    String items = "[" + FakeSpotifyWebApi.playlistItem(first)
+        + "," + FakeSpotifyWebApi.playlistItem(second) + "]";
+    return "{\"name\":\"Name\"," 
+        + "\"owner\":{\"display_name\":\"Author\"},"
+        + "\"images\":[{\"url\":\"" + PLAYLIST_ARTWORK + "\"}],"
+        + "\"tracks\":" + FakeSpotifyWebApi.pageJson(items, null) + "}";
+  }
+
   /**
    * ONE-SHOT selector: {@link MetadataResolver#resolve} walks the selector until
    * exhausted — an ever-present backend would make an empty (failed) resolution
@@ -276,24 +335,14 @@ class GoLibrespotAudioSourceManagerTest {
    * per-call attempt cap). This mirrors the finite selector T10's tests use.
    */
   private static ReadyBackendSelector oneShotSelector(ReadyBackend backend) {
-    return new ReadyBackendSelector() {
-      private boolean used;
-
-      @Override
-      public Optional<ReadyBackend> next() {
-        if (used) {
-          return Optional.empty();
-        }
-        used = true;
-        return Optional.of(backend);
-      }
-    };
+    return () -> List.of(backend);
   }
 
   /** Manager under test: fixture daemon (scripted web-api) + real pool + real resolver + fake factory. */
   static final class Rig implements AutoCloseable {
 
     final FakeLibrespotDaemon daemon = new FakeLibrespotDaemon();
+    final FakeSpotifyWebApi spotify;
     final RecordingCoordinatorFactory factory = new RecordingCoordinatorFactory();
     final List<String> logLines = Collections.synchronizedList(new ArrayList<>());
 
@@ -302,9 +351,16 @@ class GoLibrespotAudioSourceManagerTest {
     MetadataResolver resolver;
     GoLibrespotAudioSourceManager manager;
 
+    Rig(boolean directApi) {
+      spotify = directApi ? new FakeSpotifyWebApi() : null;
+    }
+
     void start() {
       try {
         daemon.start();
+        if (spotify != null) {
+          spotify.start();
+        }
         config = GoLibrespotConfig.from(Map.of(
             "enabled", true,
             "backends", List.of(Map.of(
@@ -313,8 +369,13 @@ class GoLibrespotAudioSourceManagerTest {
                 "wsUrl", daemon.getWsUrl(),
                 "fifoPath", "C:/tmp/alpha.fifo"))));
         pool = new ExclusivePool(config.getBackends());
-        resolver = new MetadataResolver(
-            oneShotSelector(new ReadyBackend(daemon.getHttpUrl())), 1500);
+        ReadyBackendSelector selector = oneShotSelector(new ReadyBackend(daemon.getHttpUrl()));
+        resolver = spotify == null
+            ? new MetadataResolver(selector, 1500)
+            : new MetadataResolver(
+                selector, 1500, "seam-client-id", "seam-client-secret", "AR",
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build(),
+                spotify.getTokenUrl(), spotify.getApiBaseUrl());
         manager = new GoLibrespotAudioSourceManager(pool, resolver, factory);
       } catch (Exception e) {
         throw new RuntimeException(e);
@@ -329,7 +390,13 @@ class GoLibrespotAudioSourceManagerTest {
         try {
           pool.shutdown();
         } finally {
-          daemon.close();
+          try {
+            daemon.close();
+          } finally {
+            if (spotify != null) {
+              spotify.close();
+            }
+          }
         }
       }
     }

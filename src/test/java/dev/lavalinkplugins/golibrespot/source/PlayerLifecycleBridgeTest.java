@@ -390,7 +390,7 @@ class PlayerLifecycleBridgeTest {
     }
 
     @Override
-    public CompletableFuture<Result> replace(String uri, long positionMs) {
+    public CompletableFuture<Result> replace(String uri, long positionMs, boolean paused) {
       replaces.add(new String[] {uri, String.valueOf(positionMs)});
       expectedUri = uri;
       return CompletableFuture.completedFuture(Result.ok("fake"));

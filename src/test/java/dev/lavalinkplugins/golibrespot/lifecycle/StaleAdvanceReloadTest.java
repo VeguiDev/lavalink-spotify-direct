@@ -103,13 +103,15 @@ class StaleAdvanceReloadTest {
       // to playing on a background thread (the main thread blocks on the
       // replacement future) at t≈250ms: after the 150ms reload window, still
       // within the machine's 800ms reconcile deadline.
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok()
+          .emit("paused", sharedData(URI_A)));
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("not_playing", sharedData(URI_A)));
       rig.daemon.status(FakeLibrespotDaemon.Response.ok(idleStatus()));
-      rig.daemon.emitAfter("playing", playingData(URI_A), 30);
+      rig.daemon.emitAfter("playing", playingData(URI_A), 100);
       Thread flipper = new Thread(() -> {
         try {
-          Thread.sleep(250);
+          Thread.sleep(500);
         } catch (InterruptedException ignored) {
           Thread.currentThread().interrupt();
         }
@@ -117,7 +119,7 @@ class StaleAdvanceReloadTest {
       });
       flipper.start();
 
-      Result replaced = rig.coordinator.replace(URI_A, 0).get(8, TimeUnit.SECONDS);
+      Result replaced = rig.coordinator.replace(URI_A, 0, false).get(8, TimeUnit.SECONDS);
       flipper.join(3_000);
 
       assertThat(replaced.isOk()).as("healthy same-URI replacement: " + replaced).isTrue();
@@ -155,13 +157,15 @@ class StaleAdvanceReloadTest {
       // gen 2 → B: the play response emits ONLY the stale not_playing(B); the
       // real playing(B) is delayed past the 150ms reload grace so the reload
       // fires; the reload's not_playing echo then drains AFTER playing confirmed.
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok()
+          .emit("paused", sharedData(URI_A)));
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("not_playing", sharedData(URI_B)));
       rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_B)));
       rig.daemon.emitAfter("playing", playingData(URI_B), 250);   // after the reload fires
       rig.daemon.emitAfter("not_playing", sharedData(URI_B), 340); // the reload echo
 
-      Result replaced = rig.coordinator.replace(URI_B, 0).get(8, TimeUnit.SECONDS);
+      Result replaced = rig.coordinator.replace(URI_B, 0, false).get(8, TimeUnit.SECONDS);
 
       assertThat(replaced.isOk()).as("stale-advance replacement: " + replaced).isTrue();
       // give the echo time to drain through the machine's reconcile before asserting
@@ -176,7 +180,7 @@ class StaleAdvanceReloadTest {
       // A + B + the reload's B = exactly 3 plays; the reload DID fire (genuine nudge)
       assertThat(playCount(rig)).isEqualTo(3);
       assertThat(rig.daemon.getReceivedCommands())
-          .filteredOn(c -> c.path().equals("/player/pause")).isEmpty();
+          .filteredOn(c -> c.path().equals("/player/pause")).hasSize(1);
       assertThat(rig.daemon.getReceivedCommands())
           .filteredOn(c -> c.path().equals("/player/stop")).isEmpty();
       assertThat(rig.coordinator.currentLease().isActive()).isTrue();

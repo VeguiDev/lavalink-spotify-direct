@@ -427,7 +427,7 @@ class GoLibrespotAudioSourceManagerTest {
     @Override public CompletableFuture<BackendStateMachine.Result> start(String uri, long positionMs) {
       return CompletableFuture.completedFuture(BackendStateMachine.Result.ok("inert"));
     }
-    @Override public CompletableFuture<BackendStateMachine.Result> replace(String uri, long positionMs) {
+    @Override public CompletableFuture<BackendStateMachine.Result> replace(String uri, long positionMs, boolean paused) {
       return CompletableFuture.completedFuture(BackendStateMachine.Result.ok("inert"));
     }
     @Override public CompletableFuture<BackendStateMachine.Result> logicalStop() {

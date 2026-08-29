@@ -578,7 +578,7 @@ class StopSequenceTest {
       assertThat(rig.coordinator.start(URI, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
       rig.daemon.play(Response.ok().emit("playing", playingData(URI_B)));
       rig.daemon.status(Response.ok(playingStatus(URI_B)));
-      assertThat(rig.coordinator.replace(URI_B, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      assertThat(rig.coordinator.replace(URI_B, 0, false).get(5, TimeUnit.SECONDS).isOk()).isTrue();
       assertThat(rig.coordinator.currentLease().isActive()).as("replace keeps the lease").isTrue();
       assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
       Lease replacedLease = rig.coordinator.currentLease();

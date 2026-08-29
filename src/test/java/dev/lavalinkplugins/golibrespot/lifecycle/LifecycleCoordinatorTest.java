@@ -76,6 +76,7 @@ class LifecycleCoordinatorTest {
 
   private static final String URI_A = "spotify:track:aaaaaaaaaaaaaaaaaaaaaa";
   private static final String URI_B = "spotify:track:bbbbbbbbbbbbbbbbbbbbbb";
+  private static final String URI_C = "spotify:track:cccccccccccccccccccccc";
 
   /** Short timings so every barrier/timeout test stays snappy and deterministic. */
   private static final Timing FAST =
@@ -203,12 +204,14 @@ class LifecycleCoordinatorTest {
       rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
       assertThat(rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
 
-      // play-over-play replacement to B: exactly one play for B, no pause/stop
+      // serialized replacement to B: pause A, then exactly one play for B
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok()
+          .emit("paused", sharedData(URI_A)));
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("playing", playingData(URI_B)));
       rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_B)));
 
-      Result replaced = rig.coordinator.replace(URI_B, 0).get(5, TimeUnit.SECONDS);
+      Result replaced = rig.coordinator.replace(URI_B, 0, false).get(5, TimeUnit.SECONDS);
 
       assertThat(replaced.isOk()).as("replacement activation: " + replaced).isTrue();
       assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
@@ -219,7 +222,7 @@ class LifecycleCoordinatorTest {
 
       List<FakeLibrespotDaemon.RecordedCommand> commands = rig.daemon.getReceivedCommands();
       assertThat(commands).filteredOn(c -> c.path().equals("/player/play")).hasSize(2);
-      assertThat(commands).filteredOn(c -> c.path().equals("/player/pause")).isEmpty();
+      assertThat(commands).filteredOn(c -> c.path().equals("/player/pause")).hasSize(1);
       assertThat(commands).filteredOn(c -> c.path().equals("/player/stop")).isEmpty();
 
       // the same FIFO stream keeps flowing for the new track (reader is reused)
@@ -243,12 +246,14 @@ class LifecycleCoordinatorTest {
       // play-over-play to B: only the stale-advance not_playing(B) is emitted by the
       // play response (no playing yet) — the coordinator must re-issue the play
       // (idempotent reload) instead of releasing; the delayed playing(B) confirms.
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok()
+          .emit("paused", sharedData(URI_A)));
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("not_playing", sharedData(URI_B)));
       rig.daemon.emitAfter("playing", playingData(URI_B), 400);
       rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_B)));
 
-      Result replaced = rig.coordinator.replace(URI_B, 0).get(5, TimeUnit.SECONDS);
+      Result replaced = rig.coordinator.replace(URI_B, 0, false).get(5, TimeUnit.SECONDS);
 
       assertThat(replaced.isOk()).as("replacement survives stale-advance re-issue: " + replaced)
           .isTrue();
@@ -259,15 +264,74 @@ class LifecycleCoordinatorTest {
       List<FakeLibrespotDaemon.RecordedCommand> commands = rig.daemon.getReceivedCommands();
       // A, B, and the re-issued B
       assertThat(commands).filteredOn(c -> c.path().equals("/player/play")).hasSize(3);
-      assertThat(commands).filteredOn(c -> c.path().equals("/player/pause")).isEmpty();
+      assertThat(commands).filteredOn(c -> c.path().equals("/player/pause")).hasSize(1);
       assertThat(commands).filteredOn(c -> c.path().equals("/player/stop")).isEmpty();
+    }
+  }
+
+  @Test
+  void replacementWaitsForCommandInFlightAndCoalescesToLatestTrack() throws Exception {
+    try (Rig rig = newRig()) {
+      rig.newPipe();
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+      assertThat(rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
+
+      rig.daemon.seek(FakeLibrespotDaemon.Response.ok());
+      rig.daemon.emitAfter("seek", seekData(URI_A, 120_000), 400);
+      CompletableFuture<Result> seek = rig.machine.seek(120_000);
+      await().atMost(Duration.ofSeconds(2))
+          .until(() -> rig.machine.phase() == BackendStateMachine.Phase.SEEKING);
+
+      CompletableFuture<Result> skippedB = rig.coordinator.replace(URI_B, 0, false);
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok().emit("paused", sharedData(URI_A)));
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_C)));
+      CompletableFuture<Result> skippedC = rig.coordinator.replace(URI_C, 0, false);
+
+      assertThat(seek.get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      assertThat(skippedB.get(5, TimeUnit.SECONDS).reason()).contains("superseded");
+      assertThat(skippedC.get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      assertThat(rig.coordinator.expectedUri()).isEqualTo(URI_C);
+
+      List<String> posts = rig.daemon.getReceivedCommands().stream()
+          .filter(c -> c.method().equals("POST"))
+          .map(FakeLibrespotDaemon.RecordedCommand::path)
+          .toList();
+      assertThat(posts).containsExactly(
+          "/player/play", "/player/seek", "/player/pause", "/player/play");
+    }
+  }
+
+  @Test
+  void replacementPreservesPausedLavalinkState() throws Exception {
+    try (Rig rig = newRig()) {
+      rig.newPipe();
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+      assertThat(rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
+
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok().emit("paused", sharedData(URI_A)));
+      assertThat(rig.machine.pause().get(5, TimeUnit.SECONDS).isOk()).isTrue();
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_B)));
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok().emit("paused", sharedData(URI_B)));
+
+      Result replaced = rig.coordinator.replace(URI_B, 0, true).get(5, TimeUnit.SECONDS);
+
+      assertThat(replaced.isOk()).isTrue();
+      assertThat(rig.machine.phase()).isEqualTo(BackendStateMachine.Phase.PAUSE_CONFIRMED);
+      List<String> posts = rig.daemon.getReceivedCommands().stream()
+          .filter(c -> c.method().equals("POST"))
+          .map(FakeLibrespotDaemon.RecordedCommand::path)
+          .toList();
+      assertThat(posts).containsExactly(
+          "/player/play", "/player/pause", "/player/play", "/player/pause");
     }
   }
 
   @Test
   void replaceWithoutHeldLeaseFails() throws Exception {
     try (Rig rig = newRig()) {
-      Result result = rig.coordinator.replace(URI_B, 0).get(5, TimeUnit.SECONDS);
+      Result result = rig.coordinator.replace(URI_B, 0, false).get(5, TimeUnit.SECONDS);
       assertThat(result.outcome()).isEqualTo(Outcome.FAILED);
     }
   }
@@ -643,6 +707,10 @@ class LifecycleCoordinatorTest {
 
   private static String sharedData(String uri) {
     return FakeLibrespotDaemon.sharedTrackData("", uri, "go-librespot");
+  }
+
+  private static String seekData(String uri, long position) {
+    return FakeLibrespotDaemon.seekData("", uri, position, 240_000, "go-librespot");
   }
 
   private static String playingStatus(String uri) {

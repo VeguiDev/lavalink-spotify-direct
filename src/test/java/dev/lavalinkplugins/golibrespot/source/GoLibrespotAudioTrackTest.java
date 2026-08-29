@@ -457,7 +457,7 @@ class GoLibrespotAudioTrackTest {
     }
 
     @Override
-    public CompletableFuture<Result> replace(String uri, long positionMs) {
+    public CompletableFuture<Result> replace(String uri, long positionMs, boolean paused) {
       return CompletableFuture.completedFuture(Result.ok("fake"));
     }
 

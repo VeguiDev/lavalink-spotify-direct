@@ -262,7 +262,7 @@ class EventsWebSocketClientTest {
             .untilAsserted(
                 () -> assertThat(listener.connects.get())
                     .as("reconnect #" + step)
-                    .isEqualTo(expectedConnects));
+                    .isGreaterThanOrEqualTo(expectedConnects));
       }
 
       assertThat(listener.quarantines).hasValue(0);

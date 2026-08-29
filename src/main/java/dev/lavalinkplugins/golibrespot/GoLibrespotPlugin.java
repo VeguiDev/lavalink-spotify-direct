@@ -72,7 +72,7 @@ public class GoLibrespotPlugin extends PluginEventHandler {
     this.runtime = ConfigFactory.build(config, line -> log.debug("{}", line));
     log.info("go-librespot plugin loaded: {} backend(s) configured, {}",
         config.getBackends().size(),
-        config.isEnabled() ? "spdirect source enabled" : "disabled");
+        config.isEnabled() ? "spotify source enabled" : "disabled");
   }
 
   // ------------------------------------------------------------ config binding

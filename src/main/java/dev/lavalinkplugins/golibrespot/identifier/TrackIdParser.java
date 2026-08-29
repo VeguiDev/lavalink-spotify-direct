@@ -5,7 +5,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Parses identifiers in the "spdirect" namespace (source name "spdirect").
+ * Parses identifiers in the "spdirect" namespace (source name "spotify").
  *
  * <p>Claims exactly two forms:
  * <ul>
@@ -25,8 +25,12 @@ public final class TrackIdParser {
   private static final Pattern BASE62_22 = Pattern.compile("[0-9A-Za-z]{22}");
   private static final Pattern SPOTIFY_TRACK_URI =
       Pattern.compile("^spotify:track:([0-9A-Za-z]+)$");
-  private static final Pattern OPEN_SPOTIFY_TRACK_URL =
-      Pattern.compile("^https://open\\.spotify\\.com/(?:[^/]+/)?track/([0-9A-Za-z]+)$");
+  private static final Pattern OPEN_SPOTIFY_TRACK_URL = Pattern.compile(
+      "^https://open\\.spotify\\.com/(?:intl-[^/]+/)?track/([0-9A-Za-z]{22})(?:[?#].*)?$");
+  private static final Pattern SPOTIFY_COLLECTION_URI =
+      Pattern.compile("^spotify:(album|playlist):([0-9A-Za-z]{22})$");
+  private static final Pattern OPEN_SPOTIFY_COLLECTION_URL = Pattern.compile(
+      "^https://open\\.spotify\\.com/(?:intl-[^/]+/)?(album|playlist)/([0-9A-Za-z]{22})(?:[?#].*)?$");
 
   private TrackIdParser() {
     // utility class
@@ -75,11 +79,21 @@ public final class TrackIdParser {
   private static TrackIdParseResult parseForeign(String identifier) {
     Matcher uri = SPOTIFY_TRACK_URI.matcher(identifier);
     if (uri.matches()) {
-      return new TrackIdParseResult.NotClaimed(Optional.of(PREFIX + uri.group(1)));
+      return isBase62Id(uri.group(1))
+          ? new TrackIdParseResult.TrackId(uri.group(1))
+          : new TrackIdParseResult.NotClaimed(Optional.empty());
     }
     Matcher url = OPEN_SPOTIFY_TRACK_URL.matcher(identifier);
     if (url.matches()) {
-      return new TrackIdParseResult.NotClaimed(Optional.of(PREFIX + url.group(1)));
+      return new TrackIdParseResult.TrackId(url.group(1));
+    }
+    Matcher collectionUri = SPOTIFY_COLLECTION_URI.matcher(identifier);
+    if (collectionUri.matches()) {
+      return new TrackIdParseResult.CollectionId(collectionUri.group(1), collectionUri.group(2));
+    }
+    Matcher collectionUrl = OPEN_SPOTIFY_COLLECTION_URL.matcher(identifier);
+    if (collectionUrl.matches()) {
+      return new TrackIdParseResult.CollectionId(collectionUrl.group(1), collectionUrl.group(2));
     }
     return new TrackIdParseResult.NotClaimed(Optional.empty());
   }
@@ -93,6 +107,9 @@ public final class TrackIdParser {
 
     /** A claimed identifier: the bare 22-char Spotify track id. */
     record TrackId(String id) implements TrackIdParseResult {}
+
+    /** A claimed Spotify album or playlist. */
+    record CollectionId(String kind, String id) implements TrackIdParseResult {}
 
     /** Not claimed by this source; optionally carries a conversion hint. */
     record NotClaimed(Optional<String> diagnosticHint) implements TrackIdParseResult {}

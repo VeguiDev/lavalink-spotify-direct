@@ -13,6 +13,10 @@ build/
 *.iml
 .vscode/
 *.swp
+.classpath
+.project
+.settings/
+bin/
 
 # Logs
 *.log

@@ -342,7 +342,7 @@ class BackendStateMachineTest {
   }
 
   @Test
-  void statusContradictsPlayingEventDegradesPermanently() throws Exception {
+  void statusCannotContradictCorrelatedPlayingEvent() throws Exception {
     try (Rig rig = newRig()) {
       // the playing event arrives, but /status insists the backend is idle
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
@@ -352,15 +352,15 @@ class BackendStateMachineTest {
       Lease lease = rig.lease();
       Result result = activate(rig, lease, URI_A);
 
-      assertThat(result.outcome()).isEqualTo(Outcome.DEGRADED);
-      assertThat(rig.machine.state()).isEqualTo(MachineState.DEGRADED);
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.DEGRADED);
-      assertThat(rig.listener.events).contains("degraded");
+      assertThat(result.isOk()).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
+      assertThat(rig.listener.events).doesNotContain("degraded");
     }
   }
 
   @Test
-  void unparseableStatusRoutesToQuarantine() throws Exception {
+  void unparseableStatusCannotVetoCorrelatedPlayingEvent() throws Exception {
     try (Rig rig = newRig()) {
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("playing", playingData(URI_A)));
@@ -369,8 +369,8 @@ class BackendStateMachineTest {
       Lease lease = rig.lease();
       Result result = activate(rig, lease, URI_A);
 
-      assertThat(result.outcome()).isEqualTo(Outcome.DEGRADED);
-      assertThat(rig.machine.state()).isEqualTo(MachineState.DEGRADED);
+      assertThat(result.isOk()).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
     }
   }
 
@@ -466,7 +466,7 @@ class BackendStateMachineTest {
   }
 
   @Test
-  void seekAckMismatchQuarantines() throws Exception {
+  void seekAckMismatchIsAdvisoryAfterAcceptedCommand() throws Exception {
     try (Rig rig = newRig()) {
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("playing", playingData(URI_A)));
@@ -477,13 +477,14 @@ class BackendStateMachineTest {
       rig.daemon.seek(FakeLibrespotDaemon.Response.ok()
           .emit("seek", seekData(URI_A, 125_000))); // 5s ahead of the request
       Result seeked = rig.machine.seek(120_000).get(5, TimeUnit.SECONDS);
-      assertThat(seeked.outcome()).isEqualTo(Outcome.QUARANTINED);
-      assertThat(rig.machine.state()).isEqualTo(MachineState.QUARANTINING);
+      assertThat(seeked.isOk()).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.machine.phase()).isEqualTo(Phase.PLAYING);
     }
   }
 
   @Test
-  void pausedThenLateNotPlayingIsContradictionNoCrash() throws Exception {
+  void pausedThenLateNotPlayingIsIgnored() throws Exception {
     try (Rig rig = newRig()) {
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()
           .emit("playing", playingData(URI_A)));
@@ -497,12 +498,14 @@ class BackendStateMachineTest {
       assertThat(rig.machine.phase()).isEqualTo(Phase.PAUSE_CONFIRMED);
 
       // stop-race analog: a buffered not_playing drains after the pause ack —
-      // the machine must not crash and must treat it as contradictory state
+      // the machine must not crash or let a stale client event override Lavalink
       rig.daemon.emit("not_playing", sharedData(URI_A));
 
       await().atMost(Duration.ofSeconds(5)).untilAsserted(
-          () -> assertThat(rig.machine.state()).isEqualTo(MachineState.DEGRADED));
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.DEGRADED);
+          () -> assertThat(rig.machine.ignoredEvents()).isGreaterThan(0));
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.machine.phase()).isEqualTo(Phase.PAUSE_CONFIRMED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
     }
   }
 

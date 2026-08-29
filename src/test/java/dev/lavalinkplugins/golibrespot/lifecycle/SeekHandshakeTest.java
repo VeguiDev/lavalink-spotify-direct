@@ -195,11 +195,11 @@ class SeekHandshakeTest {
   }
 
   // ==================================================================
-  // Seek-ack mismatch → abort + quarantine
+  // Seek-ack mismatch is advisory after an accepted Lavalink command
   // ==================================================================
 
   @Test
-  void seekAckMismatchAbortsTrackAndQuarantinesWithoutResume() throws Exception {
+  void seekAckMismatchDoesNotOverrideAcceptedSeek() throws Exception {
     try (Rig rig = newRig()) {
       rig.newPipe();
       rig.daemon.seekAckMismatch(true); // every seek also emits a seek event 5 s ahead
@@ -209,15 +209,14 @@ class SeekHandshakeTest {
 
       Result result = rig.handshake.seek(SEEK_POS, true);
 
-      assertThat(result.outcome()).as("mismatch surfaces as quarantine: " + result)
-          .isEqualTo(Outcome.QUARANTINED);
-      assertThat(rig.machine.state()).isEqualTo(MachineState.QUARANTINING);
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.QUARANTINING);
-      assertThat(rig.seekPerformed).as("no seek-performed signal on an aborted seek").isEmpty();
+      assertThat(result.isOk()).as("accepted seek survives stale ack: " + result).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
+      assertThat(rig.seekPerformed).hasSize(1);
 
       List<RecordedCommand> posts = posts(rig.daemon.getReceivedCommands());
-      assertThat(postPaths(posts)).containsExactly("/player/play", "/player/pause", "/player/seek");
-      assertThat(posts).filteredOn(c -> c.path().equals("/player/resume")).isEmpty();
+      assertThat(postPaths(posts))
+          .containsExactly("/player/play", "/player/pause", "/player/seek", "/player/resume");
     }
   }
 
@@ -297,29 +296,30 @@ class SeekHandshakeTest {
   }
 
   // ==================================================================
-  // Pause failure → abort + quarantine, never a bare seek
+  // Accepted pause remains authoritative when acknowledgements lag
   // ==================================================================
 
   @Test
-  void pauseTimeoutAbortsAndQuarantinesWithoutIssuingSeek() throws Exception {
+  void pauseTimeoutDoesNotAbortAcceptedSeekHandshake() throws Exception {
     try (Rig rig = newRig()) {
       rig.newPipe();
       rig.daemon.play(Response.ok().emit("playing", playingData(URI)));
       rig.daemon.status(Response.ok(playingStatus(URI)));
       rig.daemon.pause(Response.ok()); // 200 but never paused, and /status never reports paused
+      rig.daemon.seek(Response.ok());
+      rig.daemon.resume(Response.ok());
       rig.activate();
 
       Result result = rig.handshake.seek(SEEK_POS, true);
 
-      assertThat(result.outcome()).as("pause timeout surfaces as quarantine: " + result)
-          .isEqualTo(Outcome.QUARANTINED);
-      assertThat(rig.machine.state()).isEqualTo(MachineState.QUARANTINING);
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.QUARANTINING);
+      assertThat(result.isOk()).as("accepted handshake survives stale status: " + result).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
+      assertThat(rig.seekPerformed).hasSize(1);
 
       List<RecordedCommand> posts = posts(rig.daemon.getReceivedCommands());
-      assertThat(postPaths(posts)).as("aborted at the pause barrier — no bare seek")
-          .containsExactly("/player/play", "/player/pause");
-      assertThat(posts).filteredOn(c -> c.path().equals("/player/seek")).isEmpty();
+      assertThat(postPaths(posts)).containsExactly(
+          "/player/play", "/player/pause", "/player/seek", "/player/resume");
     }
   }
 

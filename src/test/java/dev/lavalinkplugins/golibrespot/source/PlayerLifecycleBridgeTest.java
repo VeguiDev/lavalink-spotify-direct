@@ -81,6 +81,51 @@ class PlayerLifecycleBridgeTest {
     }
   }
 
+  @Test
+  void trackStartBeforeReplacedEndUsesActiveCoordinatorExactlyOnce() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.player.playingTrack = rig.trackB;
+
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+      rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.REPLACED));
+
+      assertThat(rig.coordinatorA.replaces)
+          .containsExactly(new String[] {"spotify:track:" + TRACK_ID_B, "0"});
+      assertThat(rig.trackB.playbackCoordinator()).isSameAs(rig.coordinatorA);
+      assertThat(rig.coordinatorA.logicalStops).isEmpty();
+    }
+  }
+
+  @Test
+  void replacedEndBeforeTrackStartUsesActiveCoordinatorExactlyOnce() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.player.playingTrack = rig.trackB;
+
+      rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.REPLACED));
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+
+      assertThat(rig.coordinatorA.replaces)
+          .containsExactly(new String[] {"spotify:track:" + TRACK_ID_B, "0"});
+      assertThat(rig.trackB.playbackCoordinator()).isSameAs(rig.coordinatorA);
+    }
+  }
+
+  @Test
+  void exceptionFromReplacedTrackCannotQuarantineCurrentSession() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.player.playingTrack = rig.trackB;
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+
+      rig.fire(new TrackExceptionEvent(rig.player, rig.trackA,
+          new FriendlyException("late old-track failure", Severity.COMMON, null)));
+
+      assertThat(rig.coordinatorA.quarantines).isEmpty();
+    }
+  }
+
   // ---------------------------------------------------------------- pause / resume
 
   @Test
@@ -293,6 +338,8 @@ class PlayerLifecycleBridgeTest {
 
         trackA = spdirectTrack(TRACK_ID, coordinatorA);
         trackB = spdirectTrack(TRACK_ID_B, coordinatorB);
+        coordinatorA.expectedUri = trackA.daemonUri();
+        coordinatorB.expectedUri = trackB.daemonUri();
         player.addListener(bridge);
       } catch (Exception e) {
         throw new RuntimeException(e);
@@ -333,16 +380,19 @@ class PlayerLifecycleBridgeTest {
     final List<String> resumes = new CopyOnWriteArrayList<>();
     final List<String> quarantines = new CopyOnWriteArrayList<>();
     volatile boolean active = true;
+    volatile String expectedUri;
 
     @Override
     public CompletableFuture<Result> start(String uri, long positionMs) {
       starts.add(new String[] {uri, String.valueOf(positionMs)});
+      expectedUri = uri;
       return CompletableFuture.completedFuture(Result.ok("fake"));
     }
 
     @Override
     public CompletableFuture<Result> replace(String uri, long positionMs) {
       replaces.add(new String[] {uri, String.valueOf(positionMs)});
+      expectedUri = uri;
       return CompletableFuture.completedFuture(Result.ok("fake"));
     }
 
@@ -398,7 +448,7 @@ class PlayerLifecycleBridgeTest {
 
     @Override
     public String expectedUri() {
-      return null;
+      return expectedUri;
     }
 
     @Override

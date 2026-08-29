@@ -249,6 +249,8 @@ public final class BackendStateMachine implements AutoCloseable {
   private volatile long expectedSeekPosition;
   private volatile boolean closed;
   private CompletableFuture<Result> pending;
+  /** The current REST command returned 2xx; events/status are then advisory acknowledgements. */
+  private boolean pendingAccepted;
   /** F4: a pause queued while the machine was ACTIVATING, applied on activation confirm. */
   private CompletableFuture<Result> queuedPause;
   /** P1: armed by the coordinator before an idempotent reload; the reload's echo is tolerated. */
@@ -367,13 +369,14 @@ public final class BackendStateMachine implements AutoCloseable {
 
   /**
    * Starts playback of {@code uri} on the held {@code lease} and awaits the
-   * current-generation {@code playing} event (activation barrier), then
-   * reconciles /status. READY → LEASED/ACTIVATING → PLAYING. May also be called
+   * current-generation {@code playing} event (activation barrier). A later
+   * /status snapshot is advisory and cannot veto that correlated event.
+   * READY → LEASED/ACTIVATING → PLAYING. May also be called
    * while already LEASED for play-over-play replacement (generation bumped).
    *
    * @param positionMs start position in ms
    * @return OK when activated; QUARANTINED on barrier timeout / transport /
-   *         HTTP failure; DEGRADED when /status contradicts the playing event
+   *         HTTP failure
    */
   public CompletableFuture<Result> activate(Lease lease, String uri, long positionMs) {
     Objects.requireNonNull(lease, "lease");
@@ -507,6 +510,7 @@ public final class BackendStateMachine implements AutoCloseable {
   private void completePending(Result result) {
     CompletableFuture<Result> current = pending;
     pending = null;
+    pendingAccepted = false;
     if (current != null) {
       current.complete(result);
     }
@@ -564,6 +568,7 @@ public final class BackendStateMachine implements AutoCloseable {
     expectedUri = uri;
     phase = Phase.ACTIVATING;
     pending = f;
+    pendingAccepted = false;
     rest.playAsync(uri, positionMs, false).whenComplete(
         (r, ex) -> submit(() -> handlePlayResponse(r, unwrapRest(ex))));
     scheduleTimeout(f, timing.activationTimeoutMs(), Phase.ACTIVATING,
@@ -611,10 +616,11 @@ public final class BackendStateMachine implements AutoCloseable {
     }
   }
 
-  /** Issues the remote pause and awaits the matching {@code paused} event (or a paused /status). */
+  /** Issues the remote pause; a successful response commits Lavalink's requested state. */
   private void issuePause(CompletableFuture<Result> f) {
     phase = Phase.PAUSING;
     pending = f;
+    pendingAccepted = false;
     rest.pauseAsync().whenComplete((r, ex) -> submit(() -> handlePauseResponse(r, unwrapRest(ex))));
     scheduleTimeout(f, timing.pauseAckTimeoutMs(), Phase.PAUSING, () -> {
       reconcile(ReconcileKind.PAUSED, expectedUri, -1, reconcileDeadline(), outcome -> {
@@ -622,6 +628,9 @@ public final class BackendStateMachine implements AutoCloseable {
           if (outcome == ReconcileOutcome.OK) {
             phase = Phase.PAUSE_CONFIRMED;
             completePending(Result.ok("paused (status)"));
+          } else if (pendingAccepted && outcome != ReconcileOutcome.UNREACHABLE) {
+            phase = Phase.PAUSE_CONFIRMED;
+            completePending(Result.ok("paused (accepted; status advisory)"));
           } else {
             fail("pause ack timeout (" + outcome + ")", false, outcome == ReconcileOutcome.UNREACHABLE);
           }
@@ -650,6 +659,7 @@ public final class BackendStateMachine implements AutoCloseable {
       return;
     }
     if (r.is2xx()) {
+      pendingAccepted = phase == Phase.PAUSING;
       return;
     }
     if (r.isNoSession()) {
@@ -667,6 +677,7 @@ public final class BackendStateMachine implements AutoCloseable {
       case PAUSE_CONFIRMED -> {
         phase = Phase.RESUMING;
         pending = f;
+        pendingAccepted = false;
         rest.resumeAsync().whenComplete((r, ex) -> submit(() -> handleResumeResponse(r, unwrapRest(ex))));
         scheduleTimeout(f, timing.pauseAckTimeoutMs(), Phase.RESUMING, () -> {
           reconcile(ReconcileKind.PLAYING, expectedUri, -1, reconcileDeadline(), outcome -> {
@@ -674,6 +685,9 @@ public final class BackendStateMachine implements AutoCloseable {
               if (outcome == ReconcileOutcome.OK) {
                 phase = Phase.PLAYING;
                 completePending(Result.ok("resumed (status)"));
+              } else if (pendingAccepted && outcome != ReconcileOutcome.UNREACHABLE) {
+                phase = Phase.PLAYING;
+                completePending(Result.ok("resumed (accepted; status advisory)"));
               } else {
                 fail("resume ack timeout (" + outcome + ")", false, outcome == ReconcileOutcome.UNREACHABLE);
               }
@@ -692,6 +706,7 @@ public final class BackendStateMachine implements AutoCloseable {
       return;
     }
     if (r.is2xx()) {
+      pendingAccepted = phase == Phase.RESUMING;
       return;
     }
     if (r.isNoSession()) {
@@ -711,6 +726,7 @@ public final class BackendStateMachine implements AutoCloseable {
         phase = Phase.SEEKING;
         expectedSeekPosition = positionMs;
         pending = f;
+        pendingAccepted = false;
         rest.seekAsync(positionMs).whenComplete((r, ex) -> submit(() -> handleSeekResponse(r, unwrapRest(ex))));
         scheduleTimeout(f, timing.seekAckTimeoutMs(), Phase.SEEKING, () -> {
           reconcile(ReconcileKind.SEEKED, expectedUri, positionMs, reconcileDeadline(), outcome -> {
@@ -718,6 +734,9 @@ public final class BackendStateMachine implements AutoCloseable {
               if (outcome == ReconcileOutcome.OK) {
                 phase = phaseBeforeSeek;
                 completePending(Result.ok("seeked to " + positionMs + " (status)"));
+              } else if (pendingAccepted && outcome != ReconcileOutcome.UNREACHABLE) {
+                phase = phaseBeforeSeek;
+                completePending(Result.ok("seeked to " + positionMs + " (accepted; status advisory)"));
               } else {
                 fail("seek ack timeout (" + outcome + ")", false, outcome == ReconcileOutcome.UNREACHABLE);
               }
@@ -735,6 +754,7 @@ public final class BackendStateMachine implements AutoCloseable {
       return;
     }
     if (r.is2xx()) {
+      pendingAccepted = phase == Phase.SEEKING;
       return;
     }
     if (r.isNoSession()) {
@@ -827,23 +847,19 @@ public final class BackendStateMachine implements AutoCloseable {
     switch (phase) {
       case ACTIVATING -> {
         phase = Phase.PLAYING;
-        reconcile(ReconcileKind.PLAYING, expectedUri, -1, reconcileDeadline(), outcome -> {
-          if (outcome == ReconcileOutcome.OK) {
-            completePending(Result.ok("activated: " + expectedUri));
-            applyQueuedPause(); // F4: a pause queued during activation applies now
-          } else {
-            fail("status contradicts playing event (" + outcome + ")", true,
-                outcome == ReconcileOutcome.UNREACHABLE);
-          }
-        });
+        // The URI-correlated event confirms that the accepted Lavalink command
+        // reached the daemon. /status is deliberately not allowed to veto this:
+        // go-librespot can publish a stale snapshot or time out while audio is
+        // already flowing, which previously degraded healthy playlist sessions.
+        completePending(Result.ok("activated: " + expectedUri));
+        applyQueuedPause(); // F4: a pause queued during activation applies now
       }
       case RESUMING -> {
         phase = Phase.PLAYING;
         completePending(Result.ok("resumed"));
       }
       case PLAYING, PAUSING, SEEKING -> ignoredEvents.incrementAndGet(); // re-affirmation / dup
-      case PAUSE_CONFIRMED, COMPLETING ->
-          fail("contradictory playing while " + phase, true, false);
+      case PAUSE_CONFIRMED, COMPLETING -> ignoredEvents.incrementAndGet();
       case IDLE -> ignoredEvents.incrementAndGet();
     }
   }
@@ -859,7 +875,7 @@ public final class BackendStateMachine implements AutoCloseable {
         completePending(Result.ok("paused"));
       }
       case PAUSE_CONFIRMED -> ignoredEvents.incrementAndGet(); // duplicate ack
-      default -> fail("contradictory paused while " + phase, true, false);
+      default -> ignoredEvents.incrementAndGet();
     }
   }
 
@@ -877,7 +893,7 @@ public final class BackendStateMachine implements AutoCloseable {
         }
       }
       case ACTIVATING -> ignoredEvents.incrementAndGet(); // stale replay of the previous lease
-      default -> fail("contradictory not_playing while " + phase, true, false);
+      default -> ignoredEvents.incrementAndGet();
     }
   }
 
@@ -895,7 +911,9 @@ public final class BackendStateMachine implements AutoCloseable {
       phase = phaseBeforeSeek;
       completePending(Result.ok("seeked to " + position));
     } else {
-      fail("seek ack mismatch: expected " + expectedSeekPosition + " got " + position, false, false);
+      // A late/stale daemon position must not override the seek requested by
+      // Lavalink. The accepted REST command remains authoritative.
+      ignoredEvents.incrementAndGet();
     }
   }
 
@@ -957,15 +975,25 @@ public final class BackendStateMachine implements AutoCloseable {
     }));
   }
 
-  /** The bounded completion reconcile: release on idle, DEGRADE on contradiction. */
+  /** The bounded completion reconcile: status can confirm or reject a completion event. */
   private void startCompletionReconcile() {
     phase = Phase.COMPLETING;
     reconcile(ReconcileKind.IDLE, expectedUri, -1, reconcileDeadline(), outcome -> {
-      if (outcome == ReconcileOutcome.OK) {
+      if (outcome == ReconcileOutcome.OK
+          || outcome == ReconcileOutcome.NO_SESSION
+          || outcome == ReconcileOutcome.UNPARSEABLE
+          || outcome == ReconcileOutcome.TIMEOUT) {
+        // A matching not_playing event is the primary completion signal. An
+        // unavailable or stale /status response cannot poison the backend.
         releaseToReady("natural completion");
+      } else if (outcome == ReconcileOutcome.UNREACHABLE) {
+        fail("completion status unreachable", false, true);
       } else {
-        fail("completion status mismatch (" + outcome + ")", true,
-            outcome == ReconcileOutcome.UNREACHABLE);
+        // /status still reports active playback: treat not_playing as stale and
+        // keep the Lavalink-owned session rather than degrading it.
+        phase = Phase.PLAYING;
+        ignoredEvents.incrementAndGet();
+        log("ignored stale not_playing for '" + expectedUri + "' (status still active)");
       }
     });
   }

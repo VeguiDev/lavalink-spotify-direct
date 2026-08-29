@@ -256,15 +256,15 @@ class StopSequenceTest {
   }
 
   @Test
-  void destroyDuringInFlightSeekThatNeverAcksReleasesViaQuarantine() throws Exception {
+  void destroyAfterAcceptedSeekWithoutAckReleasesCleanly() throws Exception {
     try (Rig rig = newRig()) {
       rig.newPipe();
       rig.daemon.play(Response.ok().emit("playing", playingData(URI)));
       rig.daemon.status(Response.ok(playingStatus(URI)));
       assertThat(rig.coordinator.start(URI, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
 
-      // a seek that never acks and whose /status never reaches the position: the
-      // machine's own seek-ack timeout quarantines and releases the lease
+      // A 2xx seek remains Lavalink's requested state even when the client never
+      // emits an ack and /status lags behind it.
       rig.daemon.seek(Response.ok());
       rig.daemon.status(Response.ok(playingStatus(URI)));
       CompletableFuture<Result> seekFuture = rig.machine.seek(SEEK_POS);
@@ -274,14 +274,13 @@ class StopSequenceTest {
 
       Result destroyed = rig.stopSeq.destroy().get(8, TimeUnit.SECONDS);
 
-      assertThat(destroyed.isOk()).as("destroy released via quarantine: " + destroyed).isTrue();
-      assertThat(rig.machine.state()).isEqualTo(MachineState.QUARANTINING);
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.QUARANTINING);
+      assertThat(destroyed.isOk()).as("destroy released accepted seek: " + destroyed).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.READY);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
       assertThat(lease.isActive()).isFalse();
       lease.release(); // idempotent — must not resurrect the backend
-      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.QUARANTINING);
-      assertThat(seekFuture.get(5, TimeUnit.SECONDS).outcome())
-          .isEqualTo(Outcome.QUARANTINED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
+      assertThat(seekFuture.get(5, TimeUnit.SECONDS).isOk()).isTrue();
     }
   }
 

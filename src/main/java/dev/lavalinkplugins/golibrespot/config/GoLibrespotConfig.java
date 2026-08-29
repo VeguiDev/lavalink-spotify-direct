@@ -52,6 +52,7 @@ public final class GoLibrespotConfig {
 
     private static final Set<String> KNOWN_KEYS = Set.of(
             "enabled", "fifoCheck", "backends",
+            "spotifyClientId", "spotifyClientSecret", "spotifyMarket",
             "restTimeoutMs", "metadataTimeoutMs", "activationTimeoutMs", "seekTimeoutMs",
             "drainTimeoutMs", "drainByteCap", "wsReconnectInitialMs", "wsReconnectMaxMs",
             "wsFailuresBeforeQuarantine", "poolAcquireTimeoutMs");
@@ -69,12 +70,16 @@ public final class GoLibrespotConfig {
     private final int wsFailuresBeforeQuarantine;
     private final int poolAcquireTimeoutMs;
     private final FifoCheck fifoCheck;
+    private final String spotifyClientId;
+    private final String spotifyClientSecret;
+    private final String spotifyMarket;
 
     private GoLibrespotConfig(boolean enabled, List<BackendConfig> backends, int restTimeoutMs,
                               int metadataTimeoutMs, int activationTimeoutMs, int seekTimeoutMs,
                               int drainTimeoutMs, int drainByteCap, int wsReconnectInitialMs,
                               int wsReconnectMaxMs, int wsFailuresBeforeQuarantine,
-                              int poolAcquireTimeoutMs, FifoCheck fifoCheck) {
+                              int poolAcquireTimeoutMs, FifoCheck fifoCheck,
+                              String spotifyClientId, String spotifyClientSecret, String spotifyMarket) {
         this.enabled = enabled;
         this.backends = List.copyOf(backends);
         this.restTimeoutMs = restTimeoutMs;
@@ -88,6 +93,9 @@ public final class GoLibrespotConfig {
         this.wsFailuresBeforeQuarantine = wsFailuresBeforeQuarantine;
         this.poolAcquireTimeoutMs = poolAcquireTimeoutMs;
         this.fifoCheck = fifoCheck;
+        this.spotifyClientId = spotifyClientId;
+        this.spotifyClientSecret = spotifyClientSecret;
+        this.spotifyMarket = spotifyMarket;
     }
 
     /**
@@ -118,7 +126,10 @@ public final class GoLibrespotConfig {
                 asInt(map.get("wsFailuresBeforeQuarantine"), "wsFailuresBeforeQuarantine",
                         ConfigDefaults.WS_FAILURES_BEFORE_QUARANTINE),
                 asInt(map.get("poolAcquireTimeoutMs"), "poolAcquireTimeoutMs", ConfigDefaults.POOL_ACQUIRE_TIMEOUT_MS),
-                fifoCheck);
+                fifoCheck,
+                asString(map.get("spotifyClientId"), "spotifyClientId", ""),
+                asString(map.get("spotifyClientSecret"), "spotifyClientSecret", ""),
+                asString(map.get("spotifyMarket"), "spotifyMarket", "AR"));
     }
 
     // ------------------------------------------------------------ effective values
@@ -221,6 +232,10 @@ public final class GoLibrespotConfig {
     public FifoCheck getFifoCheck() {
         return fifoCheck;
     }
+
+    public String getSpotifyClientId() { return spotifyClientId; }
+    public String getSpotifyClientSecret() { return spotifyClientSecret; }
+    public String getSpotifyMarket() { return spotifyMarket; }
 
     // ------------------------------------------------------------ binding helpers (package-private for BackendConfig)
 

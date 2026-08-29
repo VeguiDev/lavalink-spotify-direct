@@ -43,8 +43,8 @@ import org.junit.jupiter.api.Test;
 @Tag("release")
 class ReleaseArtifactTest {
 
-  /** Pinned release version (group/version live in build.gradle.kts: 1.0.0). */
-  private static final String JAR_NAME = "lavalink-go-librespot-1.0.0.jar";
+  /** Pinned release version (group/version live in build.gradle.kts). */
+  private static final String JAR_NAME = "lavalink-go-librespot-1.2.2.jar";
 
   private static final Path JAR_PATH =
       Path.of("build", "libs", JAR_NAME).toAbsolutePath();
@@ -72,7 +72,7 @@ class ReleaseArtifactTest {
       assertThat(pluginYml)
           .contains("name: golibrespot")
           .contains("main: dev.lavalinkplugins.golibrespot.GoLibrespotPlugin")
-          .contains("version: 1.0.0");
+          .contains("version: 1.2.2");
     }
   }
 

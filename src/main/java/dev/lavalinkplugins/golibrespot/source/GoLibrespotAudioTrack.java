@@ -120,18 +120,24 @@ public final class GoLibrespotAudioTrack extends BaseAudioTrack {
       Thread.currentThread().interrupt();
       return;
     }
-    short[] frames;
-    try {
-      frames = coordinator.nextFrame(FRAME_TIMEOUT);
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      return;
-    }
-    if (frames == null) {
-      return; // end-of-stream — the frame buffer drains and Lavaplayer fires FINISHED
-    }
-    if (frames.length > 0) {
-      pipeline.process(frames, 0, frames.length);
+    // executeProcessingLoop invokes its read executor once. The source is
+    // therefore responsible for keeping that invocation alive until a real
+    // daemon completion is observed; returning after one FIFO chunk makes
+    // Lavaplayer treat a few milliseconds of PCM as the complete track.
+    while (!Thread.currentThread().isInterrupted()) {
+      short[] frames;
+      try {
+        frames = coordinator.nextFrame(FRAME_TIMEOUT);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      if (frames == null) {
+        return; // confirmed end-of-stream (current-generation not_playing)
+      }
+      if (frames.length > 0) {
+        pipeline.process(frames, 0, frames.length);
+      }
     }
   }
 

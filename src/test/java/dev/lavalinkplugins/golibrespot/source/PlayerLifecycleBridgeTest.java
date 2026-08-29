@@ -169,12 +169,12 @@ class PlayerLifecycleBridgeTest {
   }
 
   @Test
-  void trackEndFinishedDoesNothing() {
+  void trackEndFinishedRetiresUnexpectedlyActiveSession() {
     try (Rig rig = newRig()) {
       rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.FINISHED));
       assertThat(rig.coordinatorA.starts).isEmpty();
       assertThat(rig.coordinatorA.replaces).isEmpty();
-      assertThat(rig.coordinatorA.logicalStops).isEmpty();
+      assertThat(rig.coordinatorA.logicalStops).hasSize(1);
       assertThat(rig.coordinatorA.destroys).isEmpty();
       assertThat(rig.coordinatorA.pauses).isEmpty();
       assertThat(rig.coordinatorA.resumes).isEmpty();
@@ -288,7 +288,7 @@ class PlayerLifecycleBridgeTest {
                 "wsUrl", "ws://127.0.0.1:1/events",
                 "fifoPath", "C:/tmp/alpha.fifo"))));
         pool = new ExclusivePool(config.getBackends());
-        resolver = new MetadataResolver(() -> Optional.of(new ReadyBackend("http://127.0.0.1:1")), 1500);
+        resolver = new MetadataResolver(() -> List.of(new ReadyBackend("http://127.0.0.1:1")), 1500);
         manager = new GoLibrespotAudioSourceManager(pool, resolver, (h, c) -> coordinatorA);
 
         trackA = spdirectTrack(TRACK_ID, coordinatorA);

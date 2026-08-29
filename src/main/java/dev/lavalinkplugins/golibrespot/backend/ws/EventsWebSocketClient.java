@@ -4,6 +4,7 @@ import dev.lavalinkplugins.golibrespot.logging.LogSanitizer;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -58,9 +59,10 @@ import java.util.logging.Logger;
  *       generation is below the supplier's <i>current</i> value are dropped at
  *       the dispatch boundary (stale-connection suppression; counted via
  *       {@link #getDroppedByGeneration()}).</li>
- *   <li><b>Stall watchdog.</b> If no frame arrives within
- *       {@code watchdogStallMs} (default 30 s) the connection is treated as dead:
- *       it is aborted and the normal reconnect path runs.</li>
+ *   <li><b>Heartbeat watchdog.</b> An idle connection receives a WebSocket PING
+ *       after {@code watchdogStallMs} (default 30 s). Only a missing PONG within
+ *       the connection timeout aborts the socket. Legitimately idle event streams
+ *       therefore stay connected.</li>
  *   <li><b>Clean close.</b> {@link #close()} sends a CLOSE frame, stops the
  *       reconnect loop and the watchdog, and joins the drain thread (bounded).
  *       Idempotent; after close no reconnect is ever attempted.</li>
@@ -73,7 +75,7 @@ import java.util.logging.Logger;
  */
 public final class EventsWebSocketClient implements AutoCloseable {
 
-    /** Default stall window: no message within this → connection treated as dead. */
+    /** Default idle window before sending a heartbeat PING. */
     static final long DEFAULT_WATCHDOG_STALL_MS = 30_000L;
 
     /** Bounded drain queue capacity (drop-oldest beyond this). */
@@ -103,7 +105,6 @@ public final class EventsWebSocketClient implements AutoCloseable {
     private volatile boolean started;
     private volatile boolean quarantined;
     private volatile WebSocket socket;
-    private volatile long lastMessageAt;
     private volatile long connectionGeneration = -1;
     private volatile LongSupplier generationSupplier;
     private volatile Attempt currentAttempt;
@@ -424,7 +425,7 @@ public final class EventsWebSocketClient implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------
-    // Stall watchdog
+    // Heartbeat watchdog
     // ------------------------------------------------------------------
 
     private void watchdogTick() {
@@ -433,19 +434,35 @@ public final class EventsWebSocketClient implements AutoCloseable {
         if (ws == null || attempt == null || closed.get() || quarantined) {
             return;
         }
-        long last = lastMessageAt;
-        if (last > 0 && System.currentTimeMillis() - last > watchdogStallMs) {
-            LOGGER.fine("events ws: no message for " + watchdogStallMs
-                    + "ms, aborting stalled connection (" + sanitizedUrl + ")");
-            try {
-                ws.abort();
-            } catch (Exception ignored) {
-                // already closed
+        long now = System.currentTimeMillis();
+        if (attempt.pingOutstanding.get()) {
+            if (now - attempt.pingSentAt > connectTimeoutMs) {
+                abortAttempt(ws, attempt, "heartbeat PONG timeout");
             }
-            // abort() does NOT invoke the listener's onClose — signal the
-            // manager directly so the reconnect path runs
-            attempt.disconnectLatch.countDown();
+            return;
         }
+        if (attempt.lastMessageAt > 0 && now - attempt.lastMessageAt > watchdogStallMs
+                && attempt.pingOutstanding.compareAndSet(false, true)) {
+            attempt.pingSentAt = now;
+            ws.sendPing(ByteBuffer.wrap(new byte[] {1})).whenComplete((ignored, error) -> {
+                if (error != null) {
+                    abortAttempt(ws, attempt, "heartbeat PING failed");
+                }
+            });
+        }
+    }
+
+    private void abortAttempt(WebSocket ws, Attempt attempt, String reason) {
+        if (currentAttempt != attempt || closed.get()) {
+            return;
+        }
+        LOGGER.fine("events ws: " + reason + ", reconnecting (" + sanitizedUrl + ")");
+        try {
+            ws.abort();
+        } catch (Exception ignored) {
+            // already closed
+        }
+        attempt.disconnectLatch.countDown();
     }
 
     // ------------------------------------------------------------------
@@ -492,7 +509,7 @@ public final class EventsWebSocketClient implements AutoCloseable {
                 ws.abort(); // late handshake of an abandoned/closed attempt
                 return;
             }
-            lastMessageAt = System.currentTimeMillis();
+            attempt.markAlive();
             LongSupplier gen = generationSupplier;
             connectionGeneration = gen == null ? -1 : gen.getAsLong();
         }
@@ -500,7 +517,7 @@ public final class EventsWebSocketClient implements AutoCloseable {
         @Override
         public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
             ws.request(1);
-            lastMessageAt = System.currentTimeMillis();
+            attempt.markAlive();
             if (!last) {
                 attempt.partial.append(data);
                 return null;
@@ -525,6 +542,13 @@ public final class EventsWebSocketClient implements AutoCloseable {
         }
 
         @Override
+        public CompletionStage<?> onPong(WebSocket ws, ByteBuffer message) {
+            ws.request(1);
+            attempt.markAlive();
+            return null;
+        }
+
+        @Override
         public CompletionStage<?> onClose(WebSocket ws, int statusCode, String reason) {
             if (!attempt.abandoned.get() && !closed.get()) {
                 attempt.disconnectLatch.countDown();
@@ -536,8 +560,17 @@ public final class EventsWebSocketClient implements AutoCloseable {
     /** Per-connection-attempt state. */
     private static final class Attempt {
         final AtomicBoolean abandoned = new AtomicBoolean();
+        final AtomicBoolean pingOutstanding = new AtomicBoolean();
         final CountDownLatch disconnectLatch = new CountDownLatch(1);
         final StringBuilder partial = new StringBuilder();
+        volatile long lastMessageAt;
+        volatile long pingSentAt;
+
+        void markAlive() {
+            lastMessageAt = System.currentTimeMillis();
+            pingSentAt = 0;
+            pingOutstanding.set(false);
+        }
     }
 
     // ------------------------------------------------------------------

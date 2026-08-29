@@ -118,13 +118,36 @@ class GoLibrespotAudioTrackTest {
       rig.coordinator.feed(chunk(10)); // 10 × 20 ms chunks
       Thread playback = rig.startPlayback();
 
-      await().atMost(5, TimeUnit.SECONDS).until(() -> !rig.pipeline.processCalls.isEmpty());
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline != null && !rig.pipeline.processCalls.isEmpty());
       assertThat(rig.pipeline.processCalls.get(0)).isEqualTo(chunk(10).length);
 
       rig.executor.stop();
       rig.joinPlayback(playback);
       assertThat(rig.exceptions).isEmpty();
       assertThat(rig.pipeline.closed).isTrue();
+    }
+  }
+
+  @Test
+  void keepsReadingAcrossMultipleChunksAndTransientEmptyPolls() throws Exception {
+    try (Rig rig = newRig(true)) {
+      rig.coordinator.feed(chunk(2));
+      Thread playback = rig.startPlayback();
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline != null && rig.pipeline.processCalls.size() == 1);
+
+      // The coordinator returns empty arrays between writes. The read executor
+      // must remain alive and consume a later FIFO chunk in the same track.
+      rig.coordinator.feed(chunk(3));
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline.processCalls.size() == 2);
+      assertThat(rig.pipeline.processCalls)
+          .containsExactly(chunk(2).length, chunk(3).length);
+
+      rig.executor.stop();
+      rig.joinPlayback(playback);
+      assertThat(rig.exceptions).isEmpty();
     }
   }
 
@@ -154,7 +177,8 @@ class GoLibrespotAudioTrackTest {
     try (Rig rig = newRig(true)) {
       rig.coordinator.feed(chunk(10));
       Thread playback = rig.startPlayback();
-      await().atMost(5, TimeUnit.SECONDS).until(() -> !rig.pipeline.processCalls.isEmpty());
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline != null && !rig.pipeline.processCalls.isEmpty());
 
       // the buffered frames must actually reach the frame buffer so the drain
       // below can terminate it and let the loop return to the pending-seek check
@@ -181,7 +205,8 @@ class GoLibrespotAudioTrackTest {
     try (Rig rig = newRig(true)) {
       rig.coordinator.feed(chunk(10));
       Thread playback = rig.startPlayback();
-      await().atMost(5, TimeUnit.SECONDS).until(() -> !rig.pipeline.processCalls.isEmpty());
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline != null && !rig.pipeline.processCalls.isEmpty());
       await().atMost(5, TimeUnit.SECONDS).until(() -> rig.executor.getAudioBuffer().hasReceivedFrames());
       drainBuffer(rig);
 
@@ -212,7 +237,8 @@ class GoLibrespotAudioTrackTest {
     try (Rig rig = newRig(true)) {
       rig.coordinator.feed(chunk(5));
       Thread playback = rig.startPlayback();
-      await().atMost(5, TimeUnit.SECONDS).until(() -> !rig.pipeline.processCalls.isEmpty());
+      await().atMost(5, TimeUnit.SECONDS)
+          .until(() -> rig.pipeline != null && !rig.pipeline.processCalls.isEmpty());
 
       rig.executor.stop(); // dispose + interrupt → natural stop
       rig.joinPlayback(playback);
@@ -310,7 +336,7 @@ class GoLibrespotAudioTrackTest {
                 "wsUrl", "ws://127.0.0.1:1/events",
                 "fifoPath", "C:/tmp/alpha.fifo"))));
         pool = new ExclusivePool(config.getBackends());
-        resolver = new MetadataResolver(() -> Optional.of(new ReadyBackend("http://127.0.0.1:1")), 1500);
+        resolver = new MetadataResolver(() -> List.of(new ReadyBackend("http://127.0.0.1:1")), 1500);
         manager = new GoLibrespotAudioSourceManager(pool, resolver, (h, c) -> coordinator);
         coordinator.autoActivate = autoActivate;
 

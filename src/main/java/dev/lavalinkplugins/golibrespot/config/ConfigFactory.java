@@ -21,7 +21,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -53,10 +52,9 @@ import org.slf4j.LoggerFactory;
  * {@code StopSequence.shutdown()} — the DECISIONS.md order: coordinator/reader,
  * websocket, machine, opener — plus the shared pool and each REST client).</p>
  *
- * <p>The metadata resolver gets a finite, pool-backed
- * {@link MetadataResolver.ReadyBackendSelector}: a resolve walks the READY
- * backends at most once (rotating start), an exhausted pass returns empty and
- * never revisits — a failed resolve can therefore never spin.</p>
+ * <p>The metadata resolver gets a finite, pool-backed snapshot of READY
+ * backends for every resolve. The snapshot uses a rotating start and never
+ * contains the same backend twice.</p>
  */
 public final class ConfigFactory {
 
@@ -92,7 +90,8 @@ public final class ConfigFactory {
     }
 
     MetadataResolver metadataResolver =
-        new MetadataResolver(poolReadyBackendSelector(pool), config.getMetadataTimeoutMs());
+        new MetadataResolver(poolReadyBackendSelector(pool), config.getMetadataTimeoutMs(),
+            config.getSpotifyClientId(), config.getSpotifyClientSecret(), config.getSpotifyMarket());
 
     CoordinatorFactory coordinatorFactory = new CoordinatorFactory() {
       private final AtomicBoolean closed = new AtomicBoolean();
@@ -208,35 +207,31 @@ public final class ConfigFactory {
   /**
    * A finite, pool-backed {@link MetadataResolver.ReadyBackendSelector}.
    *
-   * <p>A single resolve() drains {@code next()} until empty on failure, so the
-   * selector returns each READY backend at most once per pass, an exhausted
-   * pass returns empty (resetting the rotation for the next resolve), and a
-   * pass never revisits — a failed resolve can never spin. Successful resolves
-   * stop mid-pass and the next resolve continues from the rotating start,
-   * load-balancing across backends over consecutive loads. Thread-safe
-   * (metadata loads can run concurrently on the Lavaplayer manager).</p>
+   * <p>Each invocation returns an immutable ordered snapshot containing every
+   * currently READY backend at most once. The starting backend rotates between
+   * invocations. Snapshot creation is synchronized; callers iterate independently.</p>
    */
   static MetadataResolver.ReadyBackendSelector poolReadyBackendSelector(ExclusivePool pool) {
     return new MetadataResolver.ReadyBackendSelector() {
       private final List<BackendHandle> handles = pool.handles();
-      private int cursor; // next handle to try; guarded by the selector lock
+      private int cursor;
 
       @Override
-      public synchronized Optional<MetadataResolver.ReadyBackend> next() {
+      public synchronized List<MetadataResolver.ReadyBackend> readyBackends() {
         int n = handles.size();
         if (n == 0) {
-          return Optional.empty();
+          return List.of();
         }
+        List<MetadataResolver.ReadyBackend> ready = new java.util.ArrayList<>(n);
         for (int i = 0; i < n; i++) {
           int index = (cursor + i) % n;
           BackendHandle handle = handles.get(index);
           if (pool.stateOf(handle.getBackendId()) == BackendState.READY) {
-            cursor = index + 1; // forward-only: a pass never revisits
-            return Optional.of(new MetadataResolver.ReadyBackend(handle.getConfig().getRestBaseUrl()));
+            ready.add(new MetadataResolver.ReadyBackend(handle.getConfig().getRestBaseUrl()));
           }
         }
-        cursor = 0; // exhausted pass — next resolve starts fresh
-        return Optional.empty();
+        cursor = (cursor + 1) % n;
+        return List.copyOf(ready);
       }
     };
   }

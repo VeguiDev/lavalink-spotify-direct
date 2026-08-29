@@ -1,11 +1,9 @@
-# Release: tagged release build with checksum, SBOM, attestation + publish.
+# Release: per-commit prereleases plus tagged stable releases.
 #
-# Triggered by a push of any `v*` tag (e.g. `v1.0.0`). The tag name version
-# (tag minus the leading `v`) must match the project version in
-# build.gradle.kts (1.0.0). Gradle's jar name is derived from the tag, so a
-# mismatched tag fails loudly when the expected jar is missing. The published
-# asset adds the triggering commit's short SHA as SemVer-style build metadata:
-# `lavalink-go-librespot-1.0.0+abc1234.jar`.
+# Every push to master publishes `v<project-version>+<sha7>` as a prerelease.
+# A manually pushed `v*` tag still publishes a normal stable release, provided
+# its version matches build.gradle.kts. The JAR keeps the base version inside;
+# only the public asset name gains SemVer-style commit metadata.
 #
 # ACTION PINNING POLICY: major-version tags (@v4/@v2) are used throughout,
 # matching .github/workflows/ci.yml. For a hardened repository GitHub
@@ -46,11 +44,14 @@ name: Release
 
 on:
   push:
+    branches: [master]
     tags: ['v*']
+  workflow_dispatch:
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  # A rapid second push must not cancel the release for the previous commit.
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -92,19 +93,44 @@ jobs:
             exit 1
           fi
 
-      - name: Derive build and release jar names
-        # Tag version (v1.0.0 -> 1.0.0) must match project.version in
-        # build.gradle.kts. Gradle keeps the stable internal version; only the
-        # published asset name gains +<7-character commit SHA>.
+      - name: Derive version, tag and artifact names
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          project_version=$(sed -nE 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' build.gradle.kts)
+          if [ -z "$project_version" ] || [ "$(printf '%s\n' "$project_version" | wc -l)" -ne 1 ]; then
+            echo "::error::could not derive exactly one project version from build.gradle.kts"
+            exit 1
+          fi
+
           commit_hash="${GITHUB_SHA:0:7}"
-          build_jar_name="lavalink-go-librespot-${version}.jar"
-          release_jar_name="lavalink-go-librespot-${version}+${commit_hash}.jar"
-          echo "BUILD_JAR_NAME=${build_jar_name}" >> "$GITHUB_ENV"
-          echo "RELEASE_JAR_NAME=${release_jar_name}" >> "$GITHUB_ENV"
-          echo "Release asset: ${build_jar_name} -> ${release_jar_name}"
+          build_jar_name="lavalink-go-librespot-${project_version}.jar"
+          release_jar_name="lavalink-go-librespot-${project_version}+${commit_hash}.jar"
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$project_version" ]; then
+              echo "::error::tag version $tag_version does not match project version $project_version"
+              exit 1
+            fi
+            release_tag="$GITHUB_REF_NAME"
+            release_name="$project_version"
+            prerelease=false
+          else
+            release_tag="v${project_version}+${commit_hash}"
+            release_name="${project_version}+${commit_hash}"
+            prerelease=true
+          fi
+
+          {
+            echo "PROJECT_VERSION=${project_version}"
+            echo "BUILD_JAR_NAME=${build_jar_name}"
+            echo "RELEASE_JAR_NAME=${release_jar_name}"
+            echo "RELEASE_TAG=${release_tag}"
+            echo "RELEASE_NAME=${release_name}"
+            echo "IS_PRERELEASE=${prerelease}"
+          } >> "$GITHUB_ENV"
+          echo "Release ${release_tag}: ${build_jar_name} -> ${release_jar_name} (prerelease=${prerelease})"
 
       - name: Clean build #1 (release-artifact suite runs here)
         # --no-build-cache: the reproducibility comparison below must
@@ -117,7 +143,7 @@ jobs:
         run: |
           jar="build/libs/${BUILD_JAR_NAME}"
           if [ ! -f "$jar" ]; then
-            echo "::error::expected release jar $jar does not exist (tag/version mismatch?)"
+            echo "::error::expected release jar $jar does not exist"
             exit 1
           fi
           sha256sum "$jar" | tee /tmp/release-jar-sha-1.txt
@@ -164,14 +190,14 @@ jobs:
         shell: bash
         run: |
           python3 - "$GITHUB_WORKSPACE/build/reports/bom.json" <<'EOF'
-          import json, sys
+          import json, os, sys
           path = sys.argv[1]
           with open(path, encoding='utf-8') as f:
               bom = json.load(f)
           assert bom.get('bomFormat') == 'CycloneDX', 'not a CycloneDX BOM'
           comp = bom.get('metadata', {}).get('component', {})
           assert comp.get('name') == 'lavalink-go-librespot', comp
-          assert comp.get('version') == '1.0.0', comp
+          assert comp.get('version') == os.environ['PROJECT_VERSION'], comp
           n = len(bom.get('components', []))
           print(f'SBOM OK: {comp["name"]} {comp["version"]}, {n} graph components '
                 f'(build graph; the released jar has zero runtime deps per the '
@@ -188,6 +214,10 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ env.IS_PRERELEASE }}
           files: |
             build/libs/${{ env.RELEASE_JAR_NAME }}
             SHA256SUMS
@@ -195,3 +225,4 @@ jobs:
             build/reports/bom.xml
           fail_on_unmatched_files: true
           generate_release_notes: true
+          overwrite_files: true

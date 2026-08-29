@@ -362,28 +362,22 @@ class EventsWebSocketClientTest {
   // ------------------------------------------------------------------
 
   @Test
-  void watchdogTreatsSilentConnectionAsFailedAndReconnects() throws Exception {
+  void heartbeatKeepsSilentConnectionOpen() throws Exception {
     RecordingListener listener = new RecordingListener();
     FakeLibrespotDaemon daemon = new FakeLibrespotDaemon();
     daemon.start();
-    // tiny stall window (300ms) + high quarantine threshold so the test
-    // observes repeated watchdog cycles instead of tripping quarantine
+    // A tiny idle window exercises multiple PING/PONG heartbeat cycles.
     try (EventsWebSocketClient client =
         new EventsWebSocketClient(daemon.getWsUrl(), listener, 30, 60, 100, 300)) {
       client.start();
       assertThat(daemon.awaitWsClients(1, BOUNDED)).isTrue();
       await().atMost(BOUNDED).untilAsserted(() -> assertThat(listener.connects).hasValue(1));
 
-      // no events at all → the watchdog must treat the connection as dead and reconnect
-      await().atMost(BOUNDED).untilAsserted(() -> assertThat(listener.disconnects.get()).isGreaterThanOrEqualTo(1));
-      await().atMost(BOUNDED).untilAsserted(() -> assertThat(listener.connects.get()).isGreaterThanOrEqualTo(2));
+      Thread.sleep(1_200);
+      assertThat(listener.disconnects).hasValue(0);
+      assertThat(listener.connects).hasValue(1);
 
-      // the fresh connection works (re-emit across watchdog cycles: frames sent
-      // during a reconnect backoff gap are dropped by the daemon)
-      for (int i = 0; i < 10 && listener.events.isEmpty(); i++) {
-        daemon.emit("volume", FakeLibrespotDaemon.volumeData(9, 100));
-        Thread.sleep(100);
-      }
+      daemon.emit("volume", FakeLibrespotDaemon.volumeData(9, 100));
       await().atMost(BOUNDED).untilAsserted(() -> assertThat(listener.events).hasSize(1));
       assertThat(client.isQuarantined()).isFalse();
     } finally {

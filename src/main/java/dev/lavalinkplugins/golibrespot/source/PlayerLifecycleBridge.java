@@ -117,8 +117,17 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
     }
     switch (endReason) {
       case FINISHED -> {
-        // Natural completion: the machine already released the lease via a
-        // matching not_playing and the coordinator cleared itself — nothing to do.
+        // Normally a matching not_playing has already released the backend.
+        // If Lavaplayer finishes first (for example because a read path exits
+        // unexpectedly), retire the still-active session so it cannot poison
+        // the next track with "backend not ready".
+        if (coordinator.isActive()) {
+          log.warn("spdirect track '{}' finished while backend was still active; retiring session",
+              spdirect.trackId());
+          coordinator.logicalStop()
+              .whenComplete((result, error) ->
+                  logCompletion("finishCleanup", spdirect.trackId(), result, error));
+        }
       }
       case STOPPED -> {
         if (!coordinator.isActive()) {

@@ -119,6 +119,8 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   /** Slack beyond activation+reconcile for the coordinator's own activation await. */
   private static final long ACTIVATION_GRACE_MS = 500L;
   private static final long QUARANTINE_AWAIT_MS = 3_000L;
+  /** Safety cleanup when a stopped executor no longer calls nextFrame to drain completion. */
+  private static final long COMPLETION_DRAIN_FALLBACK_MS = 8_000L;
   /**
    * Grace after observing a stale-advance {@code not_playing} before re-issuing
    * the play (idempotent reload). If the real {@code playing} confirms within
@@ -151,6 +153,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   private volatile FifoReader reader;
   private volatile FifoOpenerSeam.OpenHandleLike openHandle;
   private volatile boolean completed;
+  private volatile boolean completionPending;
   private volatile boolean reissueFired;
   private volatile String sessionUri;
   private volatile long sessionPositionMs;
@@ -343,6 +346,10 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
       PcmDecoder d = decoder;
       return d == null ? NO_FRAMES : d.decode(data.bytes());
     }
+    if (completionPending && (event instanceof FifoReader.Event.Eof || r.pendingChunks() == 0)) {
+      finishDrainedCompletion(r);
+      return null;
+    }
     return NO_FRAMES; // no data this call, or transient writer close — not terminal
   }
 
@@ -429,6 +436,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     this.sessionPositionMs = positionMs;
     this.reissueFired = false;
     this.completed = false;
+    this.completionPending = false;
     this.decoder = new PcmDecoder(); // clear the partial-frame remainder at the track boundary
     this.barrier = b; // published synchronously at session creation (P2); reused here
 
@@ -553,6 +561,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     closeReader();
     cancelOpenQuietly();
     completed = true;
+    completionPending = false;
     lease = null;
     machineTouched = false;
   }
@@ -576,14 +585,45 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     // retire/natural-completion futures complete with the coordinator already
     // observing the release (currentLease()==null), so consumers that key off
     // the future never see the machine READY but the coordinator unsettled
-    completed = true;
+    completionPending = true;
     lease = null;
     machineTouched = false;
-    log("natural completion on backend '" + handle.getBackendId() + "' for '" + sessionUri + "'");
+    log("backend completed for '" + sessionUri + "'; draining queued PCM before EOS");
     ActivationBarrier b = barrier;
     if (b != null && b.state() == ActivationBarrier.State.PENDING) {
       b.fail(ActivationException.Kind.FAILED, "backend completed before activation");
     }
+    FifoReader completionReader = reader;
+    scheduler.schedule(() -> {
+      if (completionPending && reader == completionReader && completionReader != null) {
+        log("completion drain fallback expired for '" + sessionUri + "'; closing inactive reader");
+        finishDrainedCompletion(completionReader);
+      }
+    }, COMPLETION_DRAIN_FALLBACK_MS, TimeUnit.MILLISECONDS);
+  }
+
+  /** Completes EOS only after every FIFO chunk queued before not_playing was consumed. */
+  private synchronized void finishDrainedCompletion(FifoReader completedReader) {
+    if (!completionPending || reader != completedReader) {
+      return;
+    }
+    completed = true;
+    completionPending = false;
+    long pcmMs = completedReader.bytesRead() * 1_000L / (44_100L * 2L * 2L);
+    log("natural completion drained on backend '" + handle.getBackendId() + "' for '" + sessionUri
+        + "': pcmBytes=" + completedReader.bytesRead() + ", pcmMs=" + pcmMs
+        + ", maxQueueChunks=" + completedReader.maxPendingChunks()
+        + ", backpressureWaits=" + completedReader.backpressureWaits()
+        + ", droppedChunks=" + completedReader.droppedChunks());
+    closeReader();
+    cancelOpenQuietly();
+  }
+
+  /** Explicit stop/destroy discards buffered audio instead of waiting for natural tail drain. */
+  void discardBufferedAudio(String reason) {
+    completionPending = false;
+    completed = true;
+    log("discarding buffered PCM after " + reason);
     closeReader();
     cancelOpenQuietly();
   }
@@ -609,6 +649,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     closeReader();
     cancelOpenQuietly();
     completed = true;
+    completionPending = false;
     lease = null;
     machineTouched = false;
   }
@@ -625,6 +666,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
     closeReader();
     cancelOpenQuietly();
     completed = true;
+    completionPending = false;
     lease = null;
     machineTouched = false;
   }
@@ -766,6 +808,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
       return;
     }
     completed = true;
+    completionPending = false;
     ActivationBarrier b = barrier;
     if (b != null) {
       b.fail(ActivationException.Kind.CANCELED, "coordinator closed");

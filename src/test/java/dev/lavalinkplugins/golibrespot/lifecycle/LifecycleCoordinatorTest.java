@@ -295,9 +295,35 @@ class LifecycleCoordinatorTest {
       });
       assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.READY);
       assertThat(rig.coordinator.isActive()).isFalse();
-      assertThat(rig.coordinator.currentReader()).isNull();
+      assertThat(rig.coordinator.currentReader()).isNotNull();
 
-      // end-of-stream: process() terminates with null, never while the barrier was pending
+      // end-of-stream: the playback read drains/settles the FIFO and closes it
+      assertThat(rig.coordinator.nextFrame(Duration.ofMillis(100))).isNull();
+      assertThat(rig.coordinator.currentReader()).isNull();
+    }
+  }
+
+  @Test
+  void naturalCompletionDrainsQueuedPcmBeforeEndOfStream() throws Exception {
+    try (Rig rig = newRig()) {
+      PipedOutputStream out = rig.newPipe();
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+      assertThat(rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
+
+      short[] tail = golden(800);
+      out.write(pcmBytes(tail));
+      out.flush();
+      await().atMost(Duration.ofSeconds(2))
+          .until(() -> rig.coordinator.currentReader().pendingChunks() > 0);
+
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(idleStatus()));
+      rig.daemon.emit("not_playing", sharedData(URI_A));
+      await().atMost(Duration.ofSeconds(5))
+          .until(() -> rig.coordinator.currentLease() == null);
+
+      assertThat(drainFrames(rig.coordinator, tail.length, Duration.ofSeconds(2)))
+          .containsExactly(tail);
       assertThat(rig.coordinator.nextFrame(Duration.ofMillis(100))).isNull();
     }
   }

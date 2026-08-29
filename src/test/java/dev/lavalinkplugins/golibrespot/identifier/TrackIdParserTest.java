@@ -73,29 +73,30 @@ class TrackIdParserTest {
   }
 
   @Test
-  void ordinarySpotifyTrackUriIsNotClaimedButHinted() {
+  void ordinarySpotifyTrackUriIsClaimed() {
     TrackIdParseResult result = TrackIdParser.parse("spotify:track:" + TRACK_ID);
-    assertThat(result).isInstanceOf(NotClaimed.class);
-    assertThat(((NotClaimed) result).diagnosticHint())
-        .contains("spdirect:" + TRACK_ID);
+    assertThat(result).isEqualTo(new TrackId(TRACK_ID));
   }
 
   @Test
-  void openSpotifyTrackUrlIsNotClaimedButHinted() {
+  void openSpotifyTrackUrlIsClaimed() {
     TrackIdParseResult result =
         TrackIdParser.parse("https://open.spotify.com/track/" + TRACK_ID);
-    assertThat(result).isInstanceOf(NotClaimed.class);
-    assertThat(((NotClaimed) result).diagnosticHint())
-        .contains("spdirect:" + TRACK_ID);
+    assertThat(result).isEqualTo(new TrackId(TRACK_ID));
   }
 
   @Test
-  void openSpotifyIntlTrackUrlIsNotClaimedButHinted() {
+  void openSpotifyIntlTrackUrlIsClaimed() {
     TrackIdParseResult result =
         TrackIdParser.parse("https://open.spotify.com/intl-xx/track/" + TRACK_ID);
-    assertThat(result).isInstanceOf(NotClaimed.class);
-    assertThat(((NotClaimed) result).diagnosticHint())
-        .contains("spdirect:" + TRACK_ID);
+    assertThat(result).isEqualTo(new TrackId(TRACK_ID));
+  }
+
+  @Test
+  void openSpotifyTrackUrlAcceptsQueryAndFragment() {
+    assertThat(TrackIdParser.parse(
+        "https://open.spotify.com/intl-es/track/" + TRACK_ID + "?si=abc#fragment"))
+        .isEqualTo(new TrackId(TRACK_ID));
   }
 
   @Test
@@ -111,11 +112,11 @@ class TrackIdParserTest {
   }
 
   @Test
-  void ordinaryNonTrackSpotifyUrisAreNotClaimed() {
+  void ordinaryAlbumAndPlaylistUrisAreClaimed() {
     assertThat(TrackIdParser.parse("spotify:album:" + ALBUM_ID))
-        .isInstanceOf(NotClaimed.class);
+        .isEqualTo(new TrackIdParseResult.CollectionId("album", ALBUM_ID));
     assertThat(TrackIdParser.parse("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"))
-        .isInstanceOf(NotClaimed.class);
+        .isEqualTo(new TrackIdParseResult.CollectionId("playlist", "37i9dQZF1DXcBWIGoYBM5M"));
     assertThat(TrackIdParser.parse("spotify:episode:512ojhOuo1ktJprKbVcKyQ"))
         .isInstanceOf(NotClaimed.class);
     assertThat(TrackIdParser.parse("spotify:search:hello"))
@@ -123,11 +124,11 @@ class TrackIdParserTest {
   }
 
   @Test
-  void openSpotifyNonTrackUrlsAreNotClaimed() {
+  void openSpotifyAlbumsAndPlaylistsAreClaimed() {
     assertThat(TrackIdParser.parse("https://open.spotify.com/album/" + ALBUM_ID))
-        .isInstanceOf(NotClaimed.class);
+        .isEqualTo(new TrackIdParseResult.CollectionId("album", ALBUM_ID));
     assertThat(TrackIdParser.parse("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"))
-        .isInstanceOf(NotClaimed.class);
+        .isEqualTo(new TrackIdParseResult.CollectionId("playlist", "37i9dQZF1DXcBWIGoYBM5M"));
     assertThat(TrackIdParser.parse("https://open.spotify.com/episode/512ojhOuo1ktJprKbVcKyQ"))
         .isInstanceOf(NotClaimed.class);
     assertThat(TrackIdParser.parse("https://open.spotify.com/search/hello"))

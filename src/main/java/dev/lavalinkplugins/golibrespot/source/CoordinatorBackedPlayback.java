@@ -74,7 +74,7 @@ public final class CoordinatorBackedPlayback implements PlaybackCoordinator {
   /**
    * Wraps the {@link FifoReaderFactory} the coordinator is constructed with so
    * the wrapper captures each session's reader — the {@link SeekHandshake}
-   * drain reads THAT reader's queue (the always-draining reader holds the
+   * drain reads THAT reader's queue (the lossless reader holds the
    * pre-seek kernel bytes). Must be called before the coordinator's ctor.
    */
   public FifoReaderFactory wrapReaderFactory(FifoReaderFactory inner) {

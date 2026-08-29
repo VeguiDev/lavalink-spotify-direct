@@ -35,8 +35,8 @@ import org.junit.jupiter.api.condition.OS;
  * fixed 16 KiB chunks off the FIFO into a bounded consumer queue; when the
  * writer closes (EOF) the reader records an {@link Event.Eof}, KEEPS the read
  * end open, and resumes delivering when the writer reopens (play-over-play
- * replacement). The FIFO read never stalls on a slow consumer (drop-oldest
- * policy) — backpressure exists only at the consumer boundary.
+ * replacement). A slow consumer applies lossless backpressure through the
+ * bounded queue and FIFO to the daemon writer.
  */
 @EnabledOnOs(OS.LINUX)
 class FifoReaderTest {
@@ -139,7 +139,7 @@ class FifoReaderTest {
   }
 
   @Test
-  void neverStopsDrainingWhileConsumerIsSlow() throws Exception {
+  void appliesLosslessBackpressureWhileConsumerIsSlow() throws Exception {
     int chunks = 200;
     int chunkBytes = 16 * 1024;
     int queueCapacity = FifoReader.DEFAULT_QUEUE_CAPACITY;
@@ -162,26 +162,36 @@ class FifoReaderTest {
     writer.setDaemon(true);
     writer.start();
 
-    // The consumer takes NOTHING during the storm: the reader must keep
-    // draining (drop-oldest) so the writer is never blocked by the plugin.
-    assertThat(writerDone.await(15, TimeUnit.SECONDS))
-        .as("writer completed while the consumer took nothing — reader never stalled")
-        .isTrue();
+    // With no consumer, the bounded queue and kernel FIFO fill and pace the
+    // writer instead of dropping old PCM.
+    assertThat(writerDone.await(500, TimeUnit.MILLISECONDS))
+        .as("writer is backpressured while the consumer is idle")
+        .isFalse();
     assertThat(writerFailure.get()).isNull();
     assertThat(reader.isRunning()).isTrue();
     assertThat(reader.pendingChunks()).isLessThanOrEqualTo(queueCapacity);
 
-    // Writer EOF, then inspect the retained byte stream. FIFO reads may split
-    // writes at arbitrary offsets, so assertions must not depend on write/read
-    // chunk boundaries matching.
+    // Consume concurrently so the producer can complete, then verify every
+    // byte arrives in order. FIFO reads may split writes arbitrarily.
+    byte[] retained = new byte[chunks * chunkBytes];
+    int offset = 0;
+    while (offset < retained.length) {
+      Event event = reader.take(5_000);
+      assertThat(event).isInstanceOf(Event.Data.class);
+      byte[] bytes = ((Event.Data) event).bytes();
+      System.arraycopy(bytes, 0, retained, offset, bytes.length);
+      offset += bytes.length;
+    }
+    assertThat(writerDone.await(5, TimeUnit.SECONDS)).isTrue();
     pair.write.close();
-    byte[] retained = drainBytesUntilEof(reader, 10_000);
-
-    assertThat(retained).isNotEmpty();
+    awaitAndConsumeEof(reader, 1);
+    assertThat(retained[0]).isEqualTo((byte) 0);
     assertThat(retained[retained.length - 1])
-        .as("newest bytes retained")
+        .as("last byte retained in order")
         .isEqualTo((byte) (chunks - 1));
-    assertThat(reader.droppedChunks()).isGreaterThan(0);
+    assertThat(reader.droppedChunks()).isZero();
+    assertThat(reader.backpressureWaits()).isGreaterThan(0);
+    assertThat(reader.maxPendingChunks()).isEqualTo(queueCapacity);
   }
 
   @Test

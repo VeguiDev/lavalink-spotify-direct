@@ -36,8 +36,8 @@ import java.util.function.Consumer;
  *       §6), so pre-seek kernel bytes WILL arrive after the seek; they must be
  *       consumed and dropped here, never delivered to the pipeline post-seek.
  *       The drain consumes from the reader's bounded queue (never the FIFO read
- *       itself — the always-draining reader keeps the daemon's write end from
- *       backing up) and stops when the queue AND the pipe are stable-empty for a
+ *       itself — consuming releases any intentional writer backpressure) and
+ *       stops when the queue AND the pipe are stable-empty for a
  *       full quiet window, or when a cap is reached;</li>
  *   <li>clear the partial-frame remainder at the seek boundary
  *       ({@link PcmDecoder#reset()});</li>

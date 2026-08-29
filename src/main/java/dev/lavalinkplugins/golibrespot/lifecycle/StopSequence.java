@@ -220,6 +220,7 @@ public final class StopSequence implements AutoCloseable {
       }
       Result retire = awaitRetire();
       if (retire.isOk()) {
+        coordinator.discardBufferedAudio("destroy");
         log("lease released (destroy)");
         return awaitCoordinatorSettled("destroy");
       }
@@ -241,6 +242,7 @@ public final class StopSequence implements AutoCloseable {
   private Result retireAfter(String why) {
     Result retire = awaitRetire();
     if (retire.isOk()) {
+      coordinator.discardBufferedAudio(why);
       log("retired lease after " + why);
       return awaitCoordinatorSettled(why);
     }

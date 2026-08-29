@@ -12,7 +12,7 @@ plugins {
 }
 
 group = "dev.lavalinkplugins.golibrespot"
-version = "1.0.0"
+version = "1.2.2"
 
 repositories {
     maven("https://maven.lavalink.dev/releases")

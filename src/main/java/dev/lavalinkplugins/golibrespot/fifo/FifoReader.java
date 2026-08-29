@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
 
@@ -16,12 +17,10 @@ import java.util.concurrent.locks.LockSupport;
  *
  * <p>A dedicated daemon thread continuously reads fixed-size chunks (default
  * 16 KiB — DECISIONS.md {@code fifoReadBufferBytes}) from the FIFO {@link
- * InputStream} and delivers them to a bounded consumer queue. The FIFO is
- * drained as fast as the kernel offers bytes, so the daemon's blocking pipe
- * writes never back up. Backpressure exists only at the consumer boundary:
- * when the consumer does not keep up and the queue is full, the OLDEST
- * undelivered chunk is dropped to keep the newest audio (position is
- * daemon-authoritative — dropped PCM is never treated as loss of truth).
+ * InputStream} and delivers them to a bounded consumer queue. When the queue
+ * fills, the reader deliberately stops draining so FIFO backpressure reaches
+ * the daemon's blocking write. Raw PCM is never dropped: Lavalink's real-time
+ * consumer is the playback clock for the otherwise unpaced pipe backend.
  *
  * <p>EOF semantics (Linux FIFO): a blocking read returns -1 when ALL writers
  * close, and data resumes when a new writer opens. On EOF the reader records
@@ -76,6 +75,9 @@ public final class FifoReader implements AutoCloseable {
   private final ArrayBlockingQueue<Event> queue;
   private final AtomicLong eofCount = new AtomicLong();
   private final AtomicLong droppedChunks = new AtomicLong();
+  private final AtomicLong bytesRead = new AtomicLong();
+  private final AtomicLong backpressureWaits = new AtomicLong();
+  private final AtomicInteger maxPendingChunks = new AtomicInteger();
   private final AtomicBoolean started = new AtomicBoolean(false);
   private final Thread drainThread;
 
@@ -148,9 +150,24 @@ public final class FifoReader implements AutoCloseable {
     return queue.size();
   }
 
-  /** Number of chunks dropped by the drop-oldest overflow policy (diagnostics). */
+  /** Legacy diagnostic retained for compatibility; lossless backpressure keeps this at zero. */
   public long droppedChunks() {
     return droppedChunks.get();
+  }
+
+  /** Total PCM bytes read from the FIFO. */
+  public long bytesRead() {
+    return bytesRead.get();
+  }
+
+  /** Number of bounded waits caused by a full consumer queue. */
+  public long backpressureWaits() {
+    return backpressureWaits.get();
+  }
+
+  /** Highest observed queue depth in chunks. */
+  public int maxPendingChunks() {
+    return maxPendingChunks.get();
   }
 
   /** True until {@link #close()} is called. */
@@ -165,8 +182,8 @@ public final class FifoReader implements AutoCloseable {
 
   /**
    * The drain loop: reads fixed-size chunks, delivers them to the bounded
-   * queue (drop-oldest on overflow — the FIFO read NEVER blocks on a slow
-   * consumer), survives EOF (writer close) without closing the read end, and
+   * queue (blocking on overflow to preserve PCM and pace the writer), survives
+   * EOF (writer close) without closing the read end, and
    * resumes when the writer reopens.
    */
   private void drainLoop() {
@@ -200,17 +217,29 @@ public final class FifoReader implements AutoCloseable {
       }
       if (n > 0) {
         hadData = true;
-        enqueue(new Event.Data(Arrays.copyOf(buf, n)));
+        bytesRead.addAndGet(n);
+        if (!enqueue(new Event.Data(Arrays.copyOf(buf, n)))) {
+          return;
+        }
       }
     }
   }
 
-  /** Drop-oldest on overflow: the consumer sets the pace, the FIFO never backs up. */
-  private void enqueue(Event event) {
-    while (!queue.offer(event)) {
-      queue.poll();
-      droppedChunks.incrementAndGet();
+  /** Lossless bounded enqueue: a slow consumer applies backpressure to the FIFO writer. */
+  private boolean enqueue(Event event) {
+    while (!closed) {
+      try {
+        if (queue.offer(event, 100, TimeUnit.MILLISECONDS)) {
+          maxPendingChunks.accumulateAndGet(queue.size(), Math::max);
+          return true;
+        }
+        backpressureWaits.incrementAndGet();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+      }
     }
+    return false;
   }
 
   /**
@@ -226,6 +255,7 @@ public final class FifoReader implements AutoCloseable {
       }
       closed = true;
     }
+    drainThread.interrupt(); // unblock a backpressured queue offer
     try {
       in.close();
     } catch (IOException ignored) {

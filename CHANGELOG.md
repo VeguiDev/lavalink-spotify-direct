@@ -4,6 +4,21 @@ All notable changes to lavalink-go-librespot are documented here. This
 project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.0.0 (unreleased)
+
+### Added
+
+- **Collection (playlist/album) loading via the Spotify Web API**: playlists
+  and albums now resolve directly through Spotify's client-credentials API
+  with pagination (up to 500 tracks / 10 pages), instead of relying on the
+  go-librespot daemon passthrough, which Spotify rate-limits (HTTP 429 →
+  "Unknown file format").
+- **Audio source renamed to `spotify`** (was `spdirect`). The `spdirect:<id>`
+  identifier syntax is unchanged.
+- **New optional config keys** under `plugins.golibrespot`:
+  `spotifyClientId`, `spotifyClientSecret`, and `spotifyMarket` (default
+  `"AR"`). Collection loading requires the client credentials.
+
 ## 1.0.0 (unreleased)
 
 Initial public release of lavalink-go-librespot, a Lavalink v4 plugin that

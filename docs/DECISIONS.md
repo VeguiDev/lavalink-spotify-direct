@@ -231,7 +231,13 @@ dependencies** (`java.net.http` HttpClient + WebSocket cover REST and WS).
   load failure (never fake metadata/duration).
 - **Claim namespace** — exactly `spdirect:<22-char-base62>` and
   `spdirect:spotify:track:<id>`; ordinary Spotify URIs/URLs are understood
-  only for diagnostics/conversion hints; source name `spdirect`.
+  only for diagnostics/conversion hints; source name `spotify`.
+- **Collection resolution may exceed the track-metadata budget** — resolving a
+  playlist/album through the Spotify Web API may paginate up to 500 tracks /
+  10 pages and can therefore run longer than the 5 s `metadataTimeoutMs`
+  track-metadata budget. This is a deliberate, bounded deviation: single-track
+  metadata stays within 5 s; collection resolution is capped at 500 tracks and
+  10 pages.
 - **Volume is pipeline-only** (`external_volume: true`; no daemon volume
   forwarding).
 - **Events have no sequence/session id** — correlation is URI + generation

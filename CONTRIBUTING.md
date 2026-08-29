@@ -46,8 +46,7 @@ one will be sent back.
    `rg "Thread.sleep" src/main` must return nothing.
 3. **Claim only the `spdirect:` namespace.** The source manager claims exactly
    `spdirect:<22-char-base62>` and `spdirect:spotify:track:<id>`. Ordinary
-   Spotify URIs/URLs are never claimed. Never reuse the source name
-   "spotify".
+   Spotify URIs/URLs are never claimed. The source name is `spotify`.
 4. **No fake metadata.** A load without real metadata fails clearly. Never
    fabricate a duration, title, or artist.
 5. **Zero runtime dependencies.** The shipped JAR uses only the JDK

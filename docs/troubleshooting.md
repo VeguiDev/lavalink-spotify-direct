@@ -82,7 +82,7 @@ caps before seeking. If you hear a glitch:
 - Confirm `drainTimeoutMs` / `drainByteCap` are not absurdly small for the
   pipe's buffered content.
 - Confirm you are not also running a second reader on the same FIFO (a second
-  spdirect source instance, or a leftover process). Two readers on one pipe
+  spotify source instance, or a leftover process). Two readers on one pipe
   corrupt delivery.
 
 ## On Windows or macOS

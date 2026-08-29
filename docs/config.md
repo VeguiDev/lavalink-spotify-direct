@@ -60,6 +60,38 @@ All keys below are optional; they take the documented defaults when absent.
 The pause-ack budget (5 s) and FIFO read buffer size (16 KiB) are internal
 constants, not configuration keys.
 
+## Spotify Web API client credentials (collection loading)
+
+Optional camelCase keys under `plugins.golibrespot` that let the plugin
+resolve Spotify playlists and albums directly through the Spotify Web API
+(client-credentials flow). They are not required for single-track playback;
+without them the plugin falls back to the go-librespot daemon passthrough.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `spotifyClientId` | (none) | Spotify application client ID (string). |
+| `spotifyClientSecret` | (none) | Matching client secret (string). |
+| `spotifyMarket` | `"AR"` | ISO 3166-1 alpha-2 market code used for Web API queries (string). |
+
+**Collection (playlist/album) loading REQUIRES client credentials — without
+them the plugin falls back to the go-librespot daemon passthrough, which
+Spotify rate-limits (HTTP 429 → "Unknown file format").**
+
+Example placement inside `plugins.golibrespot`:
+
+```yaml
+plugins:
+  golibrespot:
+    enabled: true
+    spotifyClientId: your-client-id
+    spotifyClientSecret: your-client-secret
+    spotifyMarket: AR
+    backends:
+      - name: gb-1
+        restBaseUrl: http://golibrespot:3678
+        fifoPath: /spdirect/spdirect-1.fifo
+```
+
 ## Per-backend overrides
 
 Every timeout key above can be repeated inside a `backends[]` entry to

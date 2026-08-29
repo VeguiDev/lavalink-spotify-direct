@@ -1,13 +1,13 @@
 # Using this plugin with LavaSrc
 
 [LavaSrc](https://github.com/topi314/LavaSrc) provides Spotify search and
-discovery for Lavalink. This plugin (`spdirect`) provides Spotify playback
+discovery for Lavalink. This plugin (`spotify`) provides Spotify playback
 through a go-librespot daemon. They are designed to run side by side: LavaSrc
-finds tracks, `spdirect` plays them.
+finds tracks, `spotify` plays them.
 
 ## Who claims what
 
-| Input | LavaSrc | spdirect |
+| Input | LavaSrc | spotify |
 | --- | --- | --- |
 | `open.spotify.com/track/...` URLs | claimed | not claimed |
 | `open.spotify.com/album/...`, `/playlist/...`, `/artist/...` | claimed | not claimed |
@@ -19,7 +19,7 @@ finds tracks, `spdirect` plays them.
 Neither source claims `spotify:track:` URIs. If a client sends one, Lavalink
 falls through every source and returns nothing.
 
-`spdirect` returns `null` for ordinary Spotify URIs and URLs. It recognizes
+`spotify` returns `null` for ordinary Spotify URIs and URLs. It recognizes
 track-shaped ones only to build a diagnostic hint for the equivalent
 `spdirect:<id>` form; it never claims them. This keeps coexistence independent
 of source registration order.
@@ -45,7 +45,7 @@ Load or search through LavaSrc, read the returned track's
    track.info.identifier   ->   "4uLU6hMCjMI75M1A2tKUQC"
    ```
 
-3. **Play it through spdirect**:
+3. **Play it through spotify**:
 
    ```
    GET /v4/loadtracks?identifier=spdirect:4uLU6hMCjMI75M1A2tKUQC
@@ -80,23 +80,23 @@ is enough, as long as the LavaSrc track's `info.identifier` is the bare
 22-character Spotify track id. Do not attempt to derive the id from the
 `uri` field of a LavaSrc result; use `info.identifier`.
 
-## Why not share the source name "spotify"
+## Why coexistence stays deterministic
 
-The two plugins must not collide on claim behavior or source naming:
+The two plugins must not collide on claim behavior:
 
-- `spdirect` deliberately avoids the name "spotify" and never claims Spotify
-  URIs or URLs, so it cannot shadow LavaSrc's search behavior.
-- Keeping the playback source (`spdirect`) distinct from the search source
-  (LavaSrc) also makes client routing explicit: search results and playable
-  tracks are different objects, and there is no ambiguity about which plugin
-  produced a track.
+- This plugin's source is named `spotify` and claims only the `spdirect:`
+  namespace; it never claims Spotify URIs or URLs, so it cannot shadow
+  LavaSrc's search behavior.
+- Claim-based routing also makes client routing explicit: search results and
+  playable tracks are different objects, and there is no ambiguity about which
+  plugin produced a track.
 
 ## Migration
 
-Moving from LavaSrc-only (or from another Spotify source) to `spdirect`:
+Moving from LavaSrc-only (or from another Spotify source) to `spotify`:
 
 1. Keep LavaSrc installed for search.
-2. Add the `spdirect` source per the [README](../README.md) install steps.
+2. Add the `spotify` source per the [README](../README.md) install steps.
 3. Point clients at `spdirect:<id>` for playback while keeping search on
    LavaSrc.
 4. Existing playlists queued as LavaSrc tracks can stay as-is; only new loads

@@ -24,7 +24,7 @@ this project.
 
 ## What it is
 
-- A **Lavalink 4.2.x audio source** named `spdirect`. It claims exactly
+- A **Lavalink 4.2.x audio source** named `spotify`. It claims exactly
   `spdirect:<22-char-track-id>` and `spdirect:spotify:track:<id>` identifiers.
 - A **remote player controller** that drives one or more go-librespot daemons
   over their unauthenticated REST API and reconciles state through the
@@ -64,8 +64,10 @@ this project.
 
 ## Install
 
-1. Download the plugin JAR from the project's GitHub Release page (artifact
-   `lavalink-go-librespot-1.0.0.jar`).
+1. Download the plugin JAR from the project's GitHub Releases page. Every push
+   to `master` publishes a prerelease named `<version>+<sha7>` with an artifact
+   such as `lavalink-go-librespot-1.2.2+abcdef0.jar`; manually tagged versions
+   remain normal stable releases.
 2. Place the JAR into Lavalink's `plugins/` directory (create it if it does
    not exist).
 3. Restart Lavalink.

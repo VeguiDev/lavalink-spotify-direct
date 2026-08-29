@@ -36,7 +36,7 @@ This is what Lavalink sees.
 - `GoLibrespotPlugin` (`dev.lavalinkplugins.golibrespot`) is the plugin entry
   point; it extends `PluginEventHandler` and is registered as a Spring bean.
 - `GoLibrespotAudioSourceManager` is the `AudioSourceManager` for the source
-  named `spdirect`. `loadItem` parses the identifier, resolves metadata, and
+  named `spotify`. `loadItem` parses the identifier, resolves metadata, and
   returns a `GoLibrespotAudioTrack`, or `null` so Lavalink falls through to
   other sources. It never acquires a backend lease at load time.
 - `TrackIdParser` (`identifier` package) decides what is claimed: exactly
@@ -96,8 +96,8 @@ The audio plane's plumbing.
   blocking open is not interrupt-cancellable, cancellation uses a
   `DummyWriterCancellation` rendezvous: a temporary blocking writer completes
   the open, both ends close, and the opener executor is proven drained.
-- `FifoReader` is the always-draining reader (16 KiB chunks into a bounded
-  queue, drop-oldest) that keeps the daemon's writes from backing up.
+- `FifoReader` moves 16 KiB PCM chunks into a bounded, lossless queue. A full
+  queue intentionally backs up the FIFO writer so Lavalink remains the playback clock.
 - `PcmDecoder` converts interleaved little-endian s16le stereo bytes into
   `short[]` frames, preserving partial frames, and supports a discard mode
   used to drop pre-seek stale PCM.

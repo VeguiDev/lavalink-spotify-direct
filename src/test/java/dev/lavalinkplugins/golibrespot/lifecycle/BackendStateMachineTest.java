@@ -449,6 +449,30 @@ class BackendStateMachineTest {
   }
 
   @Test
+  void replacementPauseWithoutAckKeepsActiveBackendUsable() throws Exception {
+    try (Rig rig = newRig()) {
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok()
+          .emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+      Lease lease = rig.lease();
+      assertThat(activate(rig, lease, URI_A).isOk()).isTrue();
+
+      // Simulate go-librespot being busy rotating the pipe: the pause request
+      // is accepted without an acknowledgement, but the daemon still reports
+      // active playback.
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok());
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+
+      Result paused = rig.machine.pauseForReplacement().get(12, TimeUnit.SECONDS);
+
+      assertThat(paused.isOk()).isTrue();
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.machine.phase()).isIn(Phase.PLAYING, Phase.PAUSE_CONFIRMED);
+      assertThat(rig.pool.stateOf("alpha")).isEqualTo(BackendState.LEASED);
+    }
+  }
+
+  @Test
   void seekConfirmedByMatchingEvent() throws Exception {
     try (Rig rig = newRig()) {
       rig.daemon.play(FakeLibrespotDaemon.Response.ok()

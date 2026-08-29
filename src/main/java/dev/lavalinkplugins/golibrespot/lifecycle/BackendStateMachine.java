@@ -386,7 +386,18 @@ public final class BackendStateMachine implements AutoCloseable {
 
   /** Remote pause → matching {@code paused} event (or paused /status on timeout). */
   public CompletableFuture<Result> pause() {
-    return enqueue(this::startPause);
+    return enqueue(f -> startPause(f, false));
+  }
+
+  /**
+   * Pauses as part of a play-over-play replacement. A timed-out pause is
+   * reconciled against /status; if the daemon is still playing, the command
+   * is considered inconclusive but the machine is returned to PLAYING so the
+   * replacement can safely issue the new play instead of quarantining a live
+   * backend. Ordinary user pauses retain the strict failure semantics.
+   */
+  public CompletableFuture<Result> pauseForReplacement() {
+    return enqueue(f -> startPause(f, true));
   }
 
   /** Remote resume → matching {@code playing} event (or playing /status on timeout). */
@@ -595,7 +606,7 @@ public final class BackendStateMachine implements AutoCloseable {
     fail("play answered http " + r.status(), false, false);
   }
 
-  private void startPause(CompletableFuture<Result> f) {
+  private void startPause(CompletableFuture<Result> f, boolean replacement) {
     if (!requireLeased(f)) {
       return;
     }
@@ -615,24 +626,31 @@ public final class BackendStateMachine implements AutoCloseable {
       return;
     }
     switch (phase) {
-      case PLAYING -> issuePause(f);
+      case PLAYING -> issuePause(f, replacement);
       case PAUSE_CONFIRMED -> f.complete(Result.ok("already paused"));
       default -> f.complete(Result.failed("cannot pause from " + phase));
     }
   }
 
   /** Issues the remote pause; a successful response commits Lavalink's requested state. */
-  private void issuePause(CompletableFuture<Result> f) {
+  private void issuePause(CompletableFuture<Result> f, boolean replacement) {
     phase = Phase.PAUSING;
     pending = f;
     pendingAccepted = false;
-    rest.pauseAsync().whenComplete((r, ex) -> submit(() -> handlePauseResponse(r, unwrapRest(ex))));
+    rest.pauseAsync().whenComplete((r, ex) ->
+        submit(() -> handlePauseResponse(r, unwrapRest(ex), replacement)));
     scheduleTimeout(f, timing.pauseAckTimeoutMs(), Phase.PAUSING, () -> {
       reconcile(ReconcileKind.PAUSED, expectedUri, -1, reconcileDeadline(), outcome -> {
         if (pending == f) { // the paused event did not already confirm
           if (outcome == ReconcileOutcome.OK) {
             phase = Phase.PAUSE_CONFIRMED;
             completePending(Result.ok("paused (status)"));
+          } else if (replacement && outcome == ReconcileOutcome.MISMATCH) {
+            // The pause request may have reached go-librespot even though its
+            // HTTP response timed out. Keep the committed state honest and let
+            // the replacement's play supersede the old session.
+            phase = Phase.PLAYING;
+            completePending(Result.ok("pause inconclusive; replacement may proceed"));
           } else if (pendingAccepted && outcome != ReconcileOutcome.UNREACHABLE) {
             phase = Phase.PAUSE_CONFIRMED;
             completePending(Result.ok("paused (accepted; status advisory)"));
@@ -655,12 +673,32 @@ public final class BackendStateMachine implements AutoCloseable {
       queued.complete(Result.failed("cannot pause from " + phase));
       return;
     }
-    issuePause(queued);
+    issuePause(queued, false);
   }
 
-  private void handlePauseResponse(PlayerCommandResult r, RestException ex) {
+  private void handlePauseResponse(PlayerCommandResult r, RestException ex, boolean replacement) {
     if (ex != null) {
-      fail("pause transport: " + ex.kind(), false, processUnreachable(ex));
+      if (replacement && ex.kind() == RestException.Kind.TIMEOUT && pending != null) {
+        // Do not quarantine before checking daemon state. A slow/blocked pause
+        // response is common while the pipe writer is rotating during skip.
+        reconcile(ReconcileKind.PAUSED, expectedUri, -1, reconcileDeadline(), outcome -> {
+          if (pending == null) {
+            return;
+          }
+          if (outcome == ReconcileOutcome.OK) {
+            phase = Phase.PAUSE_CONFIRMED;
+            completePending(Result.ok("paused (status after timeout)"));
+          } else if (outcome == ReconcileOutcome.MISMATCH) {
+            phase = Phase.PLAYING;
+            completePending(Result.ok("pause inconclusive; replacement may proceed"));
+          } else {
+            fail("pause transport timeout (" + outcome + ")", false,
+                outcome == ReconcileOutcome.UNREACHABLE);
+          }
+        });
+      } else {
+        fail("pause transport: " + ex.kind(), false, processUnreachable(ex));
+      }
       return;
     }
     if (r.is2xx()) {

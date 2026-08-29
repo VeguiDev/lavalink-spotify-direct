@@ -350,7 +350,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
           return Result.ok("already paused for replace");
         }
         case PLAYING -> {
-          Result paused = awaitMachine(machine.pause(), replacementCommandBudgetMs());
+          Result paused = awaitMachine(machine.pauseForReplacement(), replacementCommandBudgetMs());
           if (paused.isOk()) {
             return paused;
           }

@@ -99,7 +99,7 @@ dependencies {
     // compileOnly api() exposure, but compileOnly is NOT on the test compile
     // classpath — tests that assert on AudioTrackInfo need this test-scope
     // declaration (matches the version plugin-api 4.2.2 already resolves).
-    testImplementation("dev.arbjerg:lavaplayer:2.2.6")
+    testImplementation("dev.arbjerg:lavaplayer:2.2.7")
     // Test-only WebSocket server for the fake go-librespot daemon fixture (T6+).
     testImplementation("org.java-websocket:Java-WebSocket:1.5.7")
     // T19 integration smoke: the real Lavalink test server. The bare GAV resolves

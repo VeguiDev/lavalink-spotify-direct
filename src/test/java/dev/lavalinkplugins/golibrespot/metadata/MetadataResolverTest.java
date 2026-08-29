@@ -4,9 +4,11 @@ import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
 import dev.lavalinkplugins.golibrespot.metadata.MetadataResolver.ReadyBackend;
 import dev.lavalinkplugins.golibrespot.metadata.MetadataResolver.ReadyBackendSelector;
 import dev.lavalinkplugins.golibrespot.testfixtures.FakeLibrespotDaemon;
+import dev.lavalinkplugins.golibrespot.testfixtures.FakeSpotifyWebApi;
 import org.junit.jupiter.api.Test;
 
-import java.util.Iterator;
+import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 
@@ -27,14 +29,30 @@ class MetadataResolverTest {
 
     private static final String TRACK_ID = "4uLU6hMCjMI75M1A2tKUQC";
     private static final String TRACK_PATH = "/web-api/v1/tracks/" + TRACK_ID;
+    private static final String FAKE_TRACK_PATH = "/v1/tracks/" + TRACK_ID;
+    private static final String PLAYLIST_ID = "37i9dQZF1DXcBWIGoYBM5M";
+    private static final String PLAYLIST_PATH = "/v1/playlists/" + PLAYLIST_ID;
+    private static final String PLAYLIST_TRACKS_PATH = PLAYLIST_PATH + "/tracks";
+    private static final String DAEMON_PLAYLIST_PATH = "/web-api/v1/playlists/" + PLAYLIST_ID;
+    private static final String ALBUM_ID = "4aawyAB9vmqN3uQ7FjRGTy";
+    private static final String ALBUM_PATH = "/v1/albums/" + ALBUM_ID;
 
     private static ReadyBackend backend(FakeLibrespotDaemon daemon) {
         return new ReadyBackend(daemon.getHttpUrl());
     }
 
     private static ReadyBackendSelector selector(ReadyBackend... backends) {
-        Iterator<ReadyBackend> it = List.of(backends).iterator();
-        return () -> it.hasNext() ? Optional.of(it.next()) : Optional.empty();
+        return () -> List.of(backends);
+    }
+
+    /**
+     * Builds a resolver pointed at a fake Spotify Web API via the root
+     * constructor's injected HttpClient + tokenUrl + apiBaseUrl seam.
+     */
+    private static MetadataResolver seamResolver(FakeSpotifyWebApi fake, ReadyBackendSelector selector) {
+        return new MetadataResolver(selector, 5_000L, "seam-client-id", "seam-client-secret", "AR",
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build(),
+                fake.getTokenUrl(), fake.getApiBaseUrl());
     }
 
     /**
@@ -81,6 +99,26 @@ class MetadataResolverTest {
                 "https://i.scdn.co/image/abc",
                 251_000L,
                 "USRC18204510");
+    }
+
+    private static String collectionTrackJson(String id, String name) {
+        return FakeSpotifyWebApi.trackObjectJson(
+                id, name, "Collection Artist", "Collection Album",
+                "https://i.scdn.co/image/track", 180_000L, "USRC10000001");
+    }
+
+    private static String playlistJson(String itemsJson, String nextUrl) {
+        return "{\"name\":\"Fixture Playlist\","
+                + "\"owner\":{\"display_name\":\"Fixture Owner\"},"
+                + "\"images\":[{\"url\":\"https://i.scdn.co/image/playlist\"}],"
+                + "\"tracks\":" + FakeSpotifyWebApi.pageJson(itemsJson, nextUrl) + "}";
+    }
+
+    private static String albumJson(String itemsJson, String nextUrl) {
+        return "{\"name\":\"Fixture Album\","
+                + "\"artists\":[{\"name\":\"Fixture Album Artist\"}],"
+                + "\"images\":[{\"url\":\"https://i.scdn.co/image/album\"}],"
+                + "\"tracks\":" + FakeSpotifyWebApi.pageJson(itemsJson, nextUrl) + "}";
     }
 
     // ------------------------------------------------------------------
@@ -164,7 +202,7 @@ class MetadataResolverTest {
 
     @Test
     void emptyWhenNoReadyBackend() throws Exception {
-        MetadataResolver resolver = new MetadataResolver(() -> Optional.empty());
+        MetadataResolver resolver = new MetadataResolver(List::of);
 
         assertThat(resolver.resolve(TRACK_ID)).isEmpty();
     }
@@ -329,6 +367,244 @@ class MetadataResolverTest {
             assertThat(resolver.resolve(TRACK_ID)).isEmpty();
             assertThat(first.getReceivedCommands()).hasSize(1);
             assertThat(second.getReceivedCommands()).hasSize(1);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Test seam: injected HttpClient + tokenUrl + apiBaseUrl
+    // ------------------------------------------------------------------
+
+    @Test
+    void directApiFetchHitsInjectedApiBaseUrl() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(FAKE_TRACK_PATH, FakeSpotifyWebApi.Response.ok(fullTrackJson()));
+            fake.start();
+
+            MetadataResolver resolver = seamResolver(fake, List::of);
+
+            Optional<AudioTrackInfo> result = resolver.resolve(TRACK_ID);
+
+            assertThat(result).isPresent();
+            assertThat(result.orElseThrow().title).isEqualTo("Livin' on a Prayer");
+            // the request log is only reachable via the fake's own host:port,
+            // so these recorded URLs prove the direct fetch hit the injected base
+            assertThat(fake.getReceivedRequests()).extracting(FakeSpotifyWebApi.RecordedRequest::url)
+                    .containsExactly(fake.getTokenUrl(), fake.getApiBaseUrl() + FAKE_TRACK_PATH + "?market=AR");
+        }
+    }
+
+    @Test
+    void tokenFetchHitsInjectedTokenUrl() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(FAKE_TRACK_PATH, FakeSpotifyWebApi.Response.ok(fullTrackJson()));
+            fake.scriptPost("/api/token", FakeSpotifyWebApi.Response.ok(
+                    FakeSpotifyWebApi.tokenJson("seam-access-token", 3600)));
+            fake.start();
+
+            MetadataResolver resolver = seamResolver(fake, List::of);
+
+            assertThat(resolver.resolve(TRACK_ID)).isPresent();
+
+            FakeSpotifyWebApi.RecordedRequest tokenRequest = fake.getReceivedRequests().get(0);
+            assertThat(tokenRequest.url()).isEqualTo(fake.getTokenUrl());
+            assertThat(tokenRequest.method()).isEqualTo("POST");
+            assertThat(tokenRequest.body()).contains("grant_type=client_credentials");
+            assertThat(fake.hitCount("POST", "/api/token")).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void blankCredentialsSkipDirectPathAndUseDaemon() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi();
+             FakeLibrespotDaemon daemon = new FakeLibrespotDaemon()) {
+            fake.scriptGet(FAKE_TRACK_PATH, FakeSpotifyWebApi.Response.ok(fullTrackJson()));
+            fake.start();
+            daemon.scriptGet(TRACK_PATH, FakeLibrespotDaemon.Response.error(404));
+            daemon.start();
+
+            MetadataResolver resolver = new MetadataResolver(selector(backend(daemon)));
+
+            assertThat(resolver.resolve(TRACK_ID)).isEmpty();
+            assertThat(fake.getReceivedRequests()).isEmpty();
+            assertThat(daemon.getReceivedCommands()).extracting(FakeLibrespotDaemon.RecordedCommand::path)
+                    .containsExactly(TRACK_PATH);
+        }
+    }
+
+    @Test
+    void tokenFailureFallsThroughToDaemonPath() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi();
+             FakeLibrespotDaemon daemon = new FakeLibrespotDaemon()) {
+            fake.scriptPost("/api/token", FakeSpotifyWebApi.Response.error(500));
+            fake.start();
+            daemon.scriptGet(TRACK_PATH, FakeLibrespotDaemon.Response.ok(fullTrackJson()));
+            daemon.start();
+
+            MetadataResolver resolver = seamResolver(fake, selector(backend(daemon)));
+
+            Optional<AudioTrackInfo> result = resolver.resolve(TRACK_ID);
+
+            assertThat(result).isPresent();
+            assertThat(result.orElseThrow().title).isEqualTo("Livin' on a Prayer");
+            assertThat(fake.hitCount("POST", "/api/token")).isEqualTo(1);
+            assertThat(daemon.getReceivedCommands()).extracting(FakeLibrespotDaemon.RecordedCommand::path)
+                    .containsExactly(TRACK_PATH);
+        }
+    }
+
+    @Test
+    void tokenUnauthorizedFallsThroughToDaemonPath() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi();
+             FakeLibrespotDaemon daemon = new FakeLibrespotDaemon()) {
+            fake.scriptPost("/api/token", FakeSpotifyWebApi.Response.error(401));
+            fake.start();
+            daemon.scriptGet(TRACK_PATH, FakeLibrespotDaemon.Response.ok(fullTrackJson()));
+            daemon.start();
+
+            MetadataResolver resolver = seamResolver(fake, selector(backend(daemon)));
+
+            Optional<AudioTrackInfo> result = resolver.resolve(TRACK_ID);
+
+            assertThat(result).isPresent();
+            assertThat(result.orElseThrow().title).isEqualTo("Livin' on a Prayer");
+            assertThat(fake.hitCount("POST", "/api/token")).isEqualTo(1);
+            assertThat(daemon.getReceivedCommands()).extracting(FakeLibrespotDaemon.RecordedCommand::path)
+                    .containsExactly(TRACK_PATH);
+        }
+    }
+
+    @Test
+    void resolvesTwoPagePlaylistWithOwnerArtworkAndRewrittenNextHost() throws Exception {
+        String secondTrackId = "0VjIjW4GlUZAMYd2vXMi3b";
+        String productionNext = "https://api.spotify.com" + PLAYLIST_TRACKS_PATH + "?offset=1&limit=100";
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.ok(playlistJson(
+                    "[" + FakeSpotifyWebApi.playlistItem(collectionTrackJson(TRACK_ID, "First")) + "]",
+                    productionNext)));
+            fake.scriptGet(PLAYLIST_TRACKS_PATH, FakeSpotifyWebApi.Response.ok(FakeSpotifyWebApi.pageJson(
+                    "[" + FakeSpotifyWebApi.playlistItem(collectionTrackJson(secondTrackId, "Second")) + "]",
+                    null)));
+            fake.start();
+
+            MetadataResolver.CollectionMetadata metadata = seamResolver(fake, List::of)
+                    .resolveCollection("playlist", PLAYLIST_ID).orElseThrow();
+
+            assertThat(metadata.name()).isEqualTo("Fixture Playlist");
+            assertThat(metadata.author()).isEqualTo("Fixture Owner");
+            assertThat(metadata.artworkUrl()).isEqualTo("https://i.scdn.co/image/playlist");
+            assertThat(metadata.tracks()).extracting(info -> info.identifier)
+                    .containsExactly("spdirect:" + TRACK_ID, "spdirect:" + secondTrackId);
+            assertThat(fake.getReceivedRequests()).anySatisfy(request -> {
+                assertThat(request.path()).isEqualTo(PLAYLIST_TRACKS_PATH);
+                assertThat(request.query()).isEqualTo("offset=1&limit=100");
+                assertThat(request.url()).startsWith(fake.getApiBaseUrl());
+            });
+        }
+    }
+
+    @Test
+    void pageOneRateLimitGatesImmediateRetryAndFallsBackToDaemon() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi();
+             FakeLibrespotDaemon daemon = new FakeLibrespotDaemon()) {
+            fake.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.error(429).withRetryAfter("60"));
+            fake.start();
+            daemon.scriptGet(DAEMON_PLAYLIST_PATH, FakeLibrespotDaemon.Response.error(429));
+            daemon.start();
+            MetadataResolver resolver = seamResolver(fake, selector(backend(daemon)));
+
+            long beforeResolve = System.currentTimeMillis();
+            assertThat(resolver.resolveCollection("playlist", PLAYLIST_ID)).isEmpty();
+            assertThat(resolver.resolveCollection("playlist", PLAYLIST_ID)).isEmpty();
+
+            assertThat(fake.hitCount("GET", PLAYLIST_PATH)).isEqualTo(1);
+            assertThat(daemon.getReceivedCommands())
+                    .extracting(FakeLibrespotDaemon.RecordedCommand::path)
+                    .containsExactly(DAEMON_PLAYLIST_PATH, DAEMON_PLAYLIST_PATH);
+            var field = MetadataResolver.class.getDeclaredField("rateLimitedUntilMs");
+            field.setAccessible(true);
+            assertThat(field.getLong(resolver)).isGreaterThanOrEqualTo(beforeResolve + 60_000L);
+        }
+    }
+
+    @Test
+    void retriesCollectionOnceAfterUnauthorized() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.enqueueGet(PLAYLIST_PATH,
+                    FakeSpotifyWebApi.Response.error(401),
+                    FakeSpotifyWebApi.Response.ok(playlistJson("[]", null)));
+            fake.start();
+
+            assertThat(seamResolver(fake, List::of).resolveCollection("playlist", PLAYLIST_ID)).isPresent();
+            assertThat(fake.hitCount("GET", PLAYLIST_PATH)).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void pageTwoRateLimitReturnsAccumulatedPageOneTracks() throws Exception {
+        String next = "https://api.spotify.com" + PLAYLIST_TRACKS_PATH + "?offset=1&limit=100";
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.ok(playlistJson(
+                    "[" + FakeSpotifyWebApi.playlistItem(collectionTrackJson(TRACK_ID, "First")) + "]", next)));
+            fake.scriptGet(PLAYLIST_TRACKS_PATH,
+                    FakeSpotifyWebApi.Response.error(429).withRetryAfter("10"));
+            fake.start();
+
+            MetadataResolver.CollectionMetadata metadata = seamResolver(fake, List::of)
+                    .resolveCollection("playlist", PLAYLIST_ID).orElseThrow();
+
+            assertThat(metadata.tracks()).extracting(info -> info.identifier)
+                    .containsExactly("spdirect:" + TRACK_ID);
+            assertThat(fake.hitCount("GET", PLAYLIST_TRACKS_PATH)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void successfulEmptyPlaylistIsPresentAndCached() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.ok(playlistJson("[]", null)));
+            fake.start();
+            MetadataResolver resolver = seamResolver(fake, List::of);
+
+            Optional<MetadataResolver.CollectionMetadata> first = resolver.resolveCollection("playlist", PLAYLIST_ID);
+            Optional<MetadataResolver.CollectionMetadata> second = resolver.resolveCollection("playlist", PLAYLIST_ID);
+
+            assertThat(first).isPresent();
+            assertThat(first.orElseThrow().tracks()).isEmpty();
+            assertThat(second).isPresent();
+            assertThat(fake.hitCount("GET", PLAYLIST_PATH)).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void playlistNullTrackItemsAreSkippedWithoutFailure() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(PLAYLIST_PATH, FakeSpotifyWebApi.Response.ok(playlistJson(
+                    "[{\"track\":null}," + FakeSpotifyWebApi.playlistItem(
+                            collectionTrackJson(TRACK_ID, "Playable")) + "]", null)));
+            fake.start();
+
+            MetadataResolver.CollectionMetadata metadata = seamResolver(fake, List::of)
+                    .resolveCollection("playlist", PLAYLIST_ID).orElseThrow();
+
+            assertThat(metadata.tracks()).extracting(info -> info.title).containsExactly("Playable");
+        }
+    }
+
+    @Test
+    void albumRequestUsesConfiguredMarketAndLimitAndParsesMetadata() throws Exception {
+        try (FakeSpotifyWebApi fake = new FakeSpotifyWebApi()) {
+            fake.scriptGet(ALBUM_PATH, FakeSpotifyWebApi.Response.ok(albumJson("[]", null)));
+            fake.start();
+
+            MetadataResolver.CollectionMetadata metadata = seamResolver(fake, List::of)
+                    .resolveCollection("album", ALBUM_ID).orElseThrow();
+
+            assertThat(metadata.author()).isEqualTo("Fixture Album Artist");
+            assertThat(metadata.artworkUrl()).isEqualTo("https://i.scdn.co/image/album");
+            assertThat(fake.getReceivedRequests()).anySatisfy(request -> {
+                assertThat(request.path()).isEqualTo(ALBUM_PATH);
+                assertThat(request.query()).isEqualTo("market=AR&limit=50");
+            });
         }
     }
 }

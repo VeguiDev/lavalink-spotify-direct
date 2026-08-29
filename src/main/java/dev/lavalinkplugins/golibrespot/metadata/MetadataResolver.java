@@ -20,6 +20,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
+import java.net.URLEncoder;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Best-effort, lease-free track metadata resolver.
@@ -38,13 +43,16 @@ import java.util.Optional;
  * daemon, or the metadata timeout — yields {@link Optional#empty()}. The
  * caller (source manager) decides the load error from the empty result.</p>
  *
- * <p>Multi-backend: {@link #resolve(String)} walks {@link ReadyBackendSelector#next()}
- * until one backend succeeds or the selector is exhausted; a failing backend
+ * <p>Multi-backend: {@link #resolve(String)} walks the finite snapshot returned
+ * by {@link ReadyBackendSelector#readyBackends()} until one backend succeeds; a failing backend
  * is simply skipped. All log output passes through {@link LogSanitizer} so
  * tokens/secrets never reach the log. The fetch is bounded by the metadata
  * timeout (DECISIONS.md: {@code metadataTimeoutMs} = 5 s default).</p>
  */
 public final class MetadataResolver {
+
+    public record CollectionMetadata(
+            String name, String author, String artworkUrl, List<AudioTrackInfo> tracks) {}
 
     /** Daemon passthrough path prefix (API_CONTRACT.md §2.9). */
     private static final String TRACKS_PATH_PREFIX = "/web-api/v1/tracks/";
@@ -71,18 +79,16 @@ public final class MetadataResolver {
     }
 
     /**
-     * Supplies READY backends for the resolver to try, one at a time.
+     * Supplies a finite snapshot of READY backends for one resolve operation.
      *
-     * <p>Contract: each call returns the next ready backend or
-     * {@link Optional#empty()} once exhausted. Implementations MUST NOT
-     * lease/reserve the backend — the metadata fetch is best-effort and
-     * lease-free. The pool (T13) supplies this selector.
+     * <p>Implementations MUST NOT lease/reserve a backend. Each returned backend
+     * is attempted at most once by a resolve call, even when metadata fails.
      */
     @FunctionalInterface
     public interface ReadyBackendSelector {
 
-        /** @return the next ready backend to try, or empty when exhausted */
-        Optional<ReadyBackend> next();
+        /** @return an ordered, finite snapshot of ready backends */
+        List<ReadyBackend> readyBackends();
     }
 
     private final ReadyBackendSelector selector;
@@ -91,6 +97,25 @@ public final class MetadataResolver {
     private final LogSanitizer sanitizer;
     private final HttpClient httpClient;
     private final AudioTrackInfoMapper mapper = new AudioTrackInfoMapper();
+    private final String spotifyClientId;
+    private final String spotifyClientSecret;
+    private final String spotifyMarket;
+    private final String tokenUrl;
+    private final String apiBaseUrl;
+    private final Map<String, CachedTrack> trackCache = new ConcurrentHashMap<>();
+    private final Map<String, CachedCollection> collectionCache = new ConcurrentHashMap<>();
+    private final Map<String, CompletableFuture<Optional<CollectionMetadata>>> collectionInFlight =
+            new ConcurrentHashMap<>();
+    private volatile AccessToken accessToken;
+    private volatile long rateLimitedUntilMs;
+    private static final long CACHE_TTL_MS = 6 * 60 * 60 * 1000L;
+    private static final long COLLECTION_CACHE_TTL_MS = 10 * 60 * 1000L;
+    private static final int MAX_COLLECTION_TRACKS = 500;
+    private static final int MAX_COLLECTION_PAGES = 10;
+
+    private record AccessToken(String value, long expiresAtMs) {}
+    private record CachedTrack(AudioTrackInfo info, long expiresAtMs) {}
+    private record CachedCollection(CollectionMetadata metadata, long expiresAtMs) {}
 
     /** Creates a resolver with the DECISIONS.md default metadata timeout (5 s). */
     public MetadataResolver(ReadyBackendSelector selector) {
@@ -104,6 +129,39 @@ public final class MetadataResolver {
      * @param timeoutMs per-request budget for each backend's metadata fetch
      */
     public MetadataResolver(ReadyBackendSelector selector, long timeoutMs) {
+        this(selector, timeoutMs, "", "", "AR");
+    }
+
+    public MetadataResolver(ReadyBackendSelector selector, long timeoutMs,
+                            String spotifyClientId, String spotifyClientSecret, String spotifyMarket) {
+        this(selector, timeoutMs, spotifyClientId, spotifyClientSecret, spotifyMarket,
+                HttpClient.newBuilder().connectTimeout(Duration.ofMillis(timeoutMs)).build(),
+                "https://accounts.spotify.com/api/token",
+                "https://api.spotify.com");
+    }
+
+    /**
+     * Root constructor: adds the test seam over the 5-arg form.
+     *
+     * <p>Injects the {@link HttpClient} used for every direct Spotify Web API
+     * call, the client-credentials token endpoint URL, and the Spotify Web API
+     * base URL. Tests point these at a local fake; production callers get the
+     * same defaults via the delegating ctors (token
+     * {@code https://accounts.spotify.com/api/token}, API
+     * {@code https://api.spotify.com}), so production behavior is identical.
+     *
+     * @param selector source of READY backends (never leased)
+     * @param timeoutMs per-request budget for each backend's metadata fetch
+     * @param spotifyClientId client-credentials id (blank disables the direct path)
+     * @param spotifyClientSecret client-credentials secret (blank disables the direct path)
+     * @param spotifyMarket ISO 3166-1 alpha-2 market, default {@code AR} when blank
+     * @param httpClient HTTP client for direct Spotify Web API calls (never null)
+     * @param tokenUrl client-credentials token endpoint
+     * @param apiBaseUrl Spotify Web API base (path prefix {@code /v1} is appended)
+     */
+    public MetadataResolver(ReadyBackendSelector selector, long timeoutMs,
+                            String spotifyClientId, String spotifyClientSecret, String spotifyMarket,
+                            HttpClient httpClient, String tokenUrl, String apiBaseUrl) {
         this.selector = Objects.requireNonNull(selector, "selector");
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("timeoutMs must be positive: " + timeoutMs);
@@ -111,9 +169,12 @@ public final class MetadataResolver {
         this.timeoutMs = timeoutMs;
         this.log = LoggerFactory.getLogger(MetadataResolver.class);
         this.sanitizer = LogSanitizer.defaults();
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofMillis(timeoutMs))
-                .build();
+        this.httpClient = Objects.requireNonNull(httpClient, "httpClient");
+        this.spotifyClientId = spotifyClientId == null ? "" : spotifyClientId.trim();
+        this.spotifyClientSecret = spotifyClientSecret == null ? "" : spotifyClientSecret.trim();
+        this.spotifyMarket = spotifyMarket == null || spotifyMarket.isBlank() ? "AR" : spotifyMarket.trim();
+        this.tokenUrl = tokenUrl;
+        this.apiBaseUrl = apiBaseUrl;
     }
 
     /**
@@ -133,22 +194,362 @@ public final class MetadataResolver {
             log.warn("Metadata resolve skipped: blank track id");
             return Optional.empty();
         }
-        Optional<ReadyBackend> next;
-        boolean anyBackend = false;
-        while ((next = selector.next()).isPresent()) {
-            ReadyBackend backend = next.get();
-            anyBackend = true;
+        CachedTrack cached = trackCache.get(trackId);
+        long now = System.currentTimeMillis();
+        if (cached != null && cached.expiresAtMs() > now) {
+            return Optional.of(cached.info());
+        }
+        Optional<AudioTrackInfo> direct = resolveViaSpotifyWebApi(trackId, false);
+        if (direct.isPresent()) {
+            trackCache.put(trackId, new CachedTrack(direct.get(), now + CACHE_TTL_MS));
+            return direct;
+        }
+        List<ReadyBackend> backends = List.copyOf(selector.readyBackends());
+        for (ReadyBackend backend : backends) {
             String url = backend.apiBase() + TRACKS_PATH_PREFIX + trackId;
             Optional<AudioTrackInfo> resolved = tryResolve(url, trackId);
             if (resolved.isPresent()) {
+                trackCache.put(trackId, new CachedTrack(resolved.get(), now + CACHE_TTL_MS));
                 log.info("Resolved metadata for track {} via {}", trackId, sanitizer.sanitizeUrl(url));
                 return resolved;
             }
         }
-        if (!anyBackend) {
+        if (backends.isEmpty()) {
             log.warn("Metadata resolve for track {} skipped: no ready backend", trackId);
         }
+        if (cached != null) {
+            log.warn("Using stale cached Spotify metadata for track {}", trackId);
+            return Optional.of(cached.info());
+        }
         return Optional.empty();
+    }
+
+    private Optional<AudioTrackInfo> resolveViaSpotifyWebApi(String trackId, boolean retriedAfterUnauthorized) {
+        if (spotifyClientId.isBlank() || spotifyClientSecret.isBlank()
+                || System.currentTimeMillis() < rateLimitedUntilMs) {
+            return Optional.empty();
+        }
+        Optional<String> token = accessToken();
+        if (token.isEmpty()) return Optional.empty();
+        String url = apiBaseUrl + "/v1/tracks/" + trackId + "?market="
+                + URLEncoder.encode(spotifyMarket, StandardCharsets.UTF_8);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofMillis(timeoutMs))
+                    .header("Authorization", "Bearer " + token.get()).GET().build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() == HttpURLConnection.HTTP_UNAUTHORIZED && !retriedAfterUnauthorized) {
+                accessToken = null;
+                return resolveViaSpotifyWebApi(trackId, true);
+            }
+            if (response.statusCode() == 429) {
+                long retrySeconds = response.headers().firstValue("Retry-After")
+                        .flatMap(MetadataResolver::parsePositiveLong).orElse(30L);
+                rateLimitedUntilMs = System.currentTimeMillis() + Math.min(retrySeconds, 300L) * 1000L;
+                log.warn("Spotify Web API rate limited metadata requests for {} seconds", retrySeconds);
+                return Optional.empty();
+            }
+            if (response.statusCode() != HttpURLConnection.HTTP_OK || response.body().isBlank()) {
+                log.warn("Spotify Web API track metadata returned HTTP {}", response.statusCode());
+                return Optional.empty();
+            }
+            Json json = Json.parse(response.body());
+            return json instanceof JsonObject root
+                    ? toTrackMetadata(trackId, root).flatMap(mapper::map) : Optional.empty();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Spotify Web API track metadata failed: {}",
+                    sanitizer.sanitize(String.valueOf(e.getMessage())));
+        }
+        return Optional.empty();
+    }
+
+    private synchronized Optional<String> accessToken() {
+        long now = System.currentTimeMillis();
+        if (accessToken != null && accessToken.expiresAtMs() - 30_000L > now) {
+            return Optional.of(accessToken.value());
+        }
+        try {
+            String basic = Base64.getEncoder().encodeToString(
+                    (spotifyClientId + ":" + spotifyClientSecret).getBytes(StandardCharsets.UTF_8));
+            HttpRequest request = HttpRequest.newBuilder(URI.create(tokenUrl))
+                    .timeout(Duration.ofMillis(timeoutMs))
+                    .header("Authorization", "Basic " + basic)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .POST(HttpRequest.BodyPublishers.ofString("grant_type=client_credentials")).build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != HttpURLConnection.HTTP_OK || response.body().isBlank()) {
+                log.warn("Spotify token request returned HTTP {}", response.statusCode());
+                return Optional.empty();
+            }
+            Json json = Json.parse(response.body());
+            if (!(json instanceof JsonObject root)) return Optional.empty();
+            String value = root.string("access_token");
+            Long expiresIn = root.longValue("expires_in");
+            if (value == null || expiresIn == null || expiresIn <= 0) return Optional.empty();
+            accessToken = new AccessToken(value, now + expiresIn * 1000L);
+            return Optional.of(value);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Spotify token request failed: {}", sanitizer.sanitize(String.valueOf(e.getMessage())));
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Long> parsePositiveLong(String value) {
+        try {
+            long parsed = Long.parseLong(value.trim());
+            return parsed > 0 ? Optional.of(parsed) : Optional.empty();
+        } catch (RuntimeException ignored) {
+            return Optional.empty();
+        }
+    }
+
+    public Optional<CollectionMetadata> resolveCollection(String kind, String id) {
+        if (!("album".equals(kind) || "playlist".equals(kind)) || id == null || id.isBlank()) {
+            return Optional.empty();
+        }
+        String cacheKey = kind + ":" + id;
+        CachedCollection cached = collectionCache.get(cacheKey);
+        long now = System.currentTimeMillis();
+        if (cached != null && cached.expiresAtMs() > now) {
+            return Optional.of(cached.metadata());
+        }
+
+        CompletableFuture<Optional<CollectionMetadata>> flight = new CompletableFuture<>();
+        CompletableFuture<Optional<CollectionMetadata>> existing = collectionInFlight.putIfAbsent(cacheKey, flight);
+        if (existing != null) {
+            return existing.join();
+        }
+
+        try {
+            CachedCollection latest = collectionCache.get(cacheKey);
+            if (latest != null && latest.expiresAtMs() > System.currentTimeMillis()) {
+                Optional<CollectionMetadata> result = Optional.of(latest.metadata());
+                flight.complete(result);
+                return result;
+            }
+
+            Optional<CollectionMetadata> resolved = Optional.empty();
+            if (System.currentTimeMillis() >= rateLimitedUntilMs) {
+                resolved = resolveCollectionViaSpotifyWebApi(kind, id, false);
+            }
+            if (resolved.isEmpty()) {
+                resolved = resolveCollectionViaDaemon(kind, id);
+            }
+            if (resolved.isPresent()) {
+                collectionCache.put(cacheKey, new CachedCollection(
+                        resolved.get(), System.currentTimeMillis() + COLLECTION_CACHE_TTL_MS));
+            } else if (latest != null) {
+                log.warn("Using stale cached Spotify collection metadata for {}", cacheKey);
+                resolved = Optional.of(latest.metadata());
+            }
+            flight.complete(resolved);
+            return resolved;
+        } catch (RuntimeException e) {
+            CachedCollection stale = collectionCache.get(cacheKey);
+            Optional<CollectionMetadata> fallback = stale == null
+                    ? Optional.empty() : Optional.of(stale.metadata());
+            flight.complete(fallback);
+            log.warn("Spotify collection metadata {} failed: {}", cacheKey,
+                    sanitizer.sanitize(String.valueOf(e.getMessage())));
+            return fallback;
+        } finally {
+            collectionInFlight.remove(cacheKey, flight);
+        }
+    }
+
+    private Optional<CollectionMetadata> resolveCollectionViaSpotifyWebApi(
+            String kind, String id, boolean retriedAfterUnauthorized) {
+        if (spotifyClientId.isBlank() || spotifyClientSecret.isBlank()) {
+            return Optional.empty();
+        }
+        Optional<String> token = accessToken();
+        if (token.isEmpty()) {
+            return Optional.empty();
+        }
+
+        String url = "album".equals(kind)
+                ? apiBaseUrl + "/v1/albums/" + id + "?market="
+                        + URLEncoder.encode(spotifyMarket, StandardCharsets.UTF_8) + "&limit=50"
+                : apiBaseUrl + "/v1/playlists/" + id;
+        List<AudioTrackInfo> result = new ArrayList<>();
+        String name = null;
+        String author = null;
+        String artworkUrl = null;
+
+        for (int pageNumber = 1; pageNumber <= MAX_COLLECTION_PAGES && url != null; pageNumber++) {
+            try {
+                HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofMillis(timeoutMs))
+                        .header("Authorization", "Bearer " + token.get()).GET().build();
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                int status = response.statusCode();
+                if (status == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                    if (!retriedAfterUnauthorized) {
+                        accessToken = null;
+                        return resolveCollectionViaSpotifyWebApi(kind, id, true);
+                    }
+                    return Optional.empty();
+                }
+                if (status == 429) {
+                    long retrySeconds = response.headers().firstValue("Retry-After")
+                            .flatMap(MetadataResolver::parsePositiveLong).orElse(30L);
+                    long backoffSeconds = Math.min(retrySeconds, 300L);
+                    rateLimitedUntilMs = Math.max(
+                            rateLimitedUntilMs, System.currentTimeMillis() + backoffSeconds * 1000L);
+                    log.warn("Spotify Web API rate limited collection metadata for {} seconds", backoffSeconds);
+                    return pageNumber == 1 ? Optional.empty()
+                            : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+                if (status == HttpURLConnection.HTTP_NOT_FOUND) {
+                    return pageNumber == 1 ? Optional.empty()
+                            : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+                if (status != HttpURLConnection.HTTP_OK
+                        || response.body() == null || response.body().isBlank()) {
+                    log.warn("Spotify Web API collection metadata returned HTTP {}", status);
+                    return pageNumber == 1 ? Optional.empty()
+                            : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+
+                Json parsed = Json.parse(response.body());
+                if (!(parsed instanceof JsonObject root)) {
+                    return pageNumber == 1 ? Optional.empty()
+                            : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+                JsonObject page;
+                if (pageNumber == 1) {
+                    name = root.string("name");
+                    author = "playlist".equals(kind)
+                            ? root.ownerDisplayName()
+                            : root.artists().stream().findFirst().orElse(null);
+                    artworkUrl = root.imagesFirstUrl();
+                    Json tracksValue = root.fields.get("tracks");
+                    if (!(tracksValue instanceof JsonObject tracks)) {
+                        return Optional.empty();
+                    }
+                    page = tracks;
+                } else {
+                    page = root;
+                }
+
+                Json itemsValue = page.fields.get("items");
+                if (!(itemsValue instanceof JsonArray items)) {
+                    return pageNumber == 1 ? Optional.empty()
+                            : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+                appendCollectionTracks(kind, items.value, result, MAX_COLLECTION_TRACKS);
+                String next = page.string("next");
+                if (result.size() >= MAX_COLLECTION_TRACKS) {
+                    log.warn("Collection '{}:{}' truncated at 500 tracks", kind, id);
+                    return Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+                }
+                url = next == null ? null : rewriteCollectionPageUrl(next);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return pageNumber == 1 ? Optional.empty()
+                        : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+            } catch (IOException | RuntimeException e) {
+                log.warn("Spotify Web API collection metadata failed: {}",
+                        sanitizer.sanitize(String.valueOf(e.getMessage())));
+                return pageNumber == 1 ? Optional.empty()
+                        : Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+            }
+        }
+        return Optional.of(collectionMetadata(kind, name, author, artworkUrl, result));
+    }
+
+    private Optional<CollectionMetadata> resolveCollectionViaDaemon(String kind, String id) {
+        for (ReadyBackend backend : List.copyOf(selector.readyBackends())) {
+            String url = backend.apiBase() + "/web-api/v1/" + kind + "s/" + id;
+            Optional<JsonObject> response = fetchObject(url);
+            if (response.isEmpty()) {
+                continue;
+            }
+            JsonObject root = response.get();
+            Json tracksValue = root.fields.get("tracks");
+            if (!(tracksValue instanceof JsonObject tracksObject)) {
+                continue;
+            }
+            Json itemsValue = tracksObject.fields.get("items");
+            if (!(itemsValue instanceof JsonArray items)) {
+                continue;
+            }
+            List<AudioTrackInfo> result = new ArrayList<>();
+            appendCollectionTracks(kind, items.value, result, Integer.MAX_VALUE);
+            String author = "playlist".equals(kind)
+                    ? root.ownerDisplayName()
+                    : root.artists().stream().findFirst().orElse(null);
+            return Optional.of(collectionMetadata(
+                    kind, root.string("name"), author, root.imagesFirstUrl(), result));
+        }
+        return Optional.empty();
+    }
+
+    private void appendCollectionTracks(
+            String kind, List<Json> values, List<AudioTrackInfo> result, int maximumSize) {
+        for (Json value : values) {
+            if (result.size() >= maximumSize) {
+                return;
+            }
+            if (!(value instanceof JsonObject item)) {
+                continue;
+            }
+            Json candidate = "playlist".equals(kind) ? item.fields.get("track") : item;
+            if (!(candidate instanceof JsonObject track)
+                    || item.booleanValue("is_local") || track.booleanValue("is_local")) {
+                continue;
+            }
+            String trackId = track.string("id");
+            String title = track.string("name");
+            Long duration = track.longValue("duration_ms");
+            if (trackId == null || title == null || duration == null || duration <= 0) {
+                continue;
+            }
+            result.add(new AudioTrackInfo(title, String.join(", ", track.artists()), duration,
+                    "spdirect:" + trackId, true,
+                    "https://open.spotify.com/track/" + trackId,
+                    track.albumArtwork(), track.isrc()));
+        }
+    }
+
+    private CollectionMetadata collectionMetadata(
+            String kind, String name, String author, String artworkUrl, List<AudioTrackInfo> tracks) {
+        return new CollectionMetadata(
+                name == null ? "Spotify " + kind : name, author, artworkUrl, List.copyOf(tracks));
+    }
+
+    private String rewriteCollectionPageUrl(String next) {
+        URI nextUri = URI.create(next);
+        String path = nextUri.getRawPath();
+        String query = nextUri.getRawQuery();
+        return apiBaseUrl + path + (query == null ? "" : "?" + query);
+    }
+
+    private Optional<JsonObject> fetchObject(String url) {
+        String safeUrl = sanitizer.sanitizeUrl(url);
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofMillis(timeoutMs)).GET().build();
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != HttpURLConnection.HTTP_OK
+                    || response.body() == null || response.body().isBlank()) {
+                log.warn("Spotify collection metadata {} returned HTTP {}", safeUrl, response.statusCode());
+                return Optional.empty();
+            }
+            Json json = Json.parse(response.body());
+            return json instanceof JsonObject object ? Optional.of(object) : Optional.empty();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Optional.empty();
+        } catch (IOException | RuntimeException e) {
+            log.warn("Spotify collection metadata {} failed: {}", safeUrl,
+                    sanitizer.sanitize(String.valueOf(e.getMessage())));
+            return Optional.empty();
+        }
     }
 
     /**
@@ -291,6 +692,11 @@ public final class MetadataResolver {
             return v instanceof JsonNumber n ? n.value : null;
         }
 
+        boolean booleanValue(String key) {
+            Json v = fields.get(key);
+            return v instanceof JsonBool b && b.value;
+        }
+
         /** {@code artists[].name}, in order (empty when absent/malformed). */
         List<String> artists() {
             Json v = fields.get("artists");
@@ -331,6 +737,20 @@ public final class MetadataResolver {
             }
             Json first = arr.value.get(0);
             return first instanceof JsonObject o ? o.string("url") : null;
+        }
+
+        String imagesFirstUrl() {
+            Json images = fields.get("images");
+            if (!(images instanceof JsonArray arr) || arr.value.isEmpty()) {
+                return null;
+            }
+            Json first = arr.value.get(0);
+            return first instanceof JsonObject o ? o.string("url") : null;
+        }
+
+        String ownerDisplayName() {
+            Json owner = fields.get("owner");
+            return owner instanceof JsonObject o ? o.string("display_name") : null;
         }
 
         /** {@code external_ids.isrc}, or {@code null} when absent. */

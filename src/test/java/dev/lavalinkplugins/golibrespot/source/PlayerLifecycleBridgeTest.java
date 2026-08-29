@@ -178,6 +178,22 @@ class PlayerLifecycleBridgeTest {
   }
 
   @Test
+  void lateStoppedFromReplacedTrackDoesNotRaceReplacementStop() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.player.playingTrack = rig.trackB;
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+
+      // The old executor can report STOPPED after the new track was selected.
+      rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.STOPPED));
+
+      assertThat(rig.coordinatorA.logicalStops).isEmpty();
+      assertThat(rig.coordinatorA.replaces)
+          .containsExactly(new String[] {"spotify:track:" + TRACK_ID_B, "0"});
+    }
+  }
+
+  @Test
   void trackEndReplacedCallsReplaceAndReusesTheCoordinatorForTheNewTrack() {
     try (Rig rig = newRig()) {
       rig.player.playingTrack = rig.trackB;
@@ -224,6 +240,20 @@ class PlayerLifecycleBridgeTest {
       assertThat(rig.coordinatorA.pauses).isEmpty();
       assertThat(rig.coordinatorA.resumes).isEmpty();
       assertThat(rig.coordinatorA.quarantines).isEmpty();
+    }
+  }
+
+  @Test
+  void lateFinishedFromReplacedTrackDoesNotRetireReplacementSession() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.player.playingTrack = rig.trackB;
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+
+      rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.FINISHED));
+
+      assertThat(rig.coordinatorA.logicalStops).isEmpty();
+      assertThat(rig.coordinatorA.destroys).isEmpty();
     }
   }
 

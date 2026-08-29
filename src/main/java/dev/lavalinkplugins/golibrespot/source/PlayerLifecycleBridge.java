@@ -143,6 +143,13 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
     }
     switch (endReason) {
       case FINISHED -> {
+        // A replacement publishes its desired URI before the asynchronous
+        // coordinator operation starts. Lavaplayer may deliver FINISHED for
+        // the old executor afterwards; that event is stale and must not race
+        // the replacement with a second logicalStop/pause.
+        if (superseded(player, spdirect)) {
+          return;
+        }
         // Normally a matching not_playing has already released the backend.
         // If Lavaplayer finishes first (for example because a read path exits
         // unexpectedly), retire the still-active session so it cannot poison
@@ -156,6 +163,12 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
         }
       }
       case STOPPED -> {
+        // STOPPED is also commonly emitted for the executor being replaced.
+        // Once a newer URI is published, the replacement owns the transition
+        // and the old track must not issue another pause or retire the lease.
+        if (superseded(player, spdirect)) {
+          return;
+        }
         if (!owns(coordinator, spdirect)) {
           return;
         }
@@ -256,6 +269,12 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
   /** True only when the active backend session belongs to this exact track URI. */
   private static boolean owns(PlaybackCoordinator coordinator, GoLibrespotAudioTrack track) {
     return coordinator.isActive() && track.daemonUri().equals(coordinator.expectedUri());
+  }
+
+  /** True when Lavalink has already selected a different URI for this player. */
+  private boolean superseded(AudioPlayer player, GoLibrespotAudioTrack track) {
+    String desired = desiredUris.get(player);
+    return desired != null && !desired.equals(track.daemonUri());
   }
 
   private void logCompletion(String op, String trackId, Result result, Throwable error) {

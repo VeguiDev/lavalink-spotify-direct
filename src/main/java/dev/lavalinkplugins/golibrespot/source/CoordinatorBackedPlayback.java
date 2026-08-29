@@ -93,9 +93,9 @@ public final class CoordinatorBackedPlayback implements PlaybackCoordinator {
   }
 
   @Override
-  public CompletableFuture<Result> replace(String uri, long positionMs) {
+  public CompletableFuture<Result> replace(String uri, long positionMs, boolean paused) {
     decoder = new PcmDecoder();
-    return coordinator.replace(uri, positionMs);
+    return coordinator.replace(uri, positionMs, paused);
   }
 
   @Override

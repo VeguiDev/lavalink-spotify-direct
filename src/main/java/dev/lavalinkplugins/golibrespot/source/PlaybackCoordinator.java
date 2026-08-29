@@ -31,8 +31,8 @@ public interface PlaybackCoordinator {
   /** Starts a new track session (acquires the lease at play start, never at load). */
   CompletableFuture<BackendStateMachine.Result> start(String uri, long positionMs);
 
-  /** Play-over-play replacement on the HELD lease (no stop, no release-then-acquire). */
-  CompletableFuture<BackendStateMachine.Result> replace(String uri, long positionMs);
+  /** Serialized replacement on the HELD lease, preserving Lavalink's desired pause state. */
+  CompletableFuture<BackendStateMachine.Result> replace(String uri, long positionMs, boolean paused);
 
   /** Logical stop = remote pause + confirmation + generation retirement. */
   CompletableFuture<BackendStateMachine.Result> logicalStop();

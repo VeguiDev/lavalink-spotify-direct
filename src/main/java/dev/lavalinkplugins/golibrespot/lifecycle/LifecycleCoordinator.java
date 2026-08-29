@@ -28,6 +28,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 /**
@@ -41,7 +42,7 @@ import java.util.function.Consumer;
  * <p>One coordinator per backend (one per machine); sessions are sequential on
  * the backend's exclusive lease. Each track play is a session:
  * {@link #start(String, long)} acquires the lease (at play start, never at
- * load), and {@link #replace(String, long)} switches tracks play-over-play on
+ * load), and {@link #replace(String, long, boolean)} switches tracks on
  * the already-held lease.</p>
  *
  * <p><b>Activation sequence</b> (all steps bounded; nothing runs on the
@@ -55,10 +56,11 @@ import java.util.function.Consumer;
  * quarantines and the track fails). The lease is never released-then-acquired:
  * a held lease is either replaced play-over-play or retired by the machine.</p>
  *
- * <p><b>Replacement.</b> {@link #replace} calls the machine's
- * {@code activate()} with the new URI while still LEASED — the machine bumps
- * its generation and issues exactly one play; there is no stop and no
- * release-then-acquire. A {@code not_playing} for the current expected URI that
+ * <p><b>Replacement.</b> {@link #replace} waits for prior controls, pauses the
+ * old URI, discards its buffered PCM, then calls the machine's {@code activate()}
+ * with the new URI while still LEASED. The machine bumps its generation and
+ * issues exactly one play; there is no stop and no release-then-acquire. A
+ * {@code not_playing} for the current expected URI that
  * arrives before {@code playing} is observed is the known v0.9.0 stale-advance
  * artifact: the coordinator re-issues the play (idempotent reload) via the raw
  * REST client instead of releasing, once per activation.</p>
@@ -129,6 +131,8 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
    * read as a spurious completion.
    */
   private static final long STALE_ADVANCE_REISSUE_DELAY_MS = 150L;
+  private static final long REPLACE_POLL_MS = 10L;
+  private static final long REPLACE_DRAIN_STABLE_MS = 40L;
 
   private final BackendHandle handle;
   private final BackendStateMachine machine;
@@ -144,6 +148,7 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   private final ScheduledExecutorService scheduler;
   private final Path fifoPath;
   private final AtomicBoolean closed = new AtomicBoolean();
+  private final AtomicLong replacementSequence = new AtomicLong();
 
   // ---- session state (volatile for cross-thread reads; written on the lane /
   // ---- WS thread / machine lane as documented)
@@ -258,40 +263,150 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   }
 
   /**
-   * Play-over-play replacement on the held lease: issues exactly one play for
-   * the new URI via the machine (generation bumped internally) — never a stop,
-   * never release-then-acquire. The FIFO stream is reused; the decoded-frame
-   * remainder is cleared at the track boundary.
+   * Serialized replacement on the held lease: wait for prior controls, pause,
+   * discard old PCM, then issue one play for the new URI. Never uses stop or
+   * release-then-acquire; rapid queued replacements coalesce to the latest.
    */
-  public CompletableFuture<Result> replace(String uri, long positionMs) {
+  public CompletableFuture<Result> replace(String uri, long positionMs, boolean remainPaused) {
     Objects.requireNonNull(uri, "uri");
     CompletableFuture<Result> future = new CompletableFuture<>();
+    long requestId = replacementSequence.incrementAndGet();
+    ActivationBarrier sessionBarrier = new ActivationBarrier(machine.generation() + 1, uri);
+    ActivationBarrier previous = this.barrier;
+    if (previous != null && previous.state() == ActivationBarrier.State.PENDING) {
+      previous.fail(ActivationException.Kind.CANCELED, "replacement superseded by '" + uri + "'");
+    }
+    // Publish before queueing so this track's process() cannot observe the
+    // previous session's already-satisfied barrier.
+    this.barrier = sessionBarrier;
     try {
       lane.execute(() -> {
-        ActivationBarrier sessionBarrier = null;
         try {
+          if (requestId != replacementSequence.get()) {
+            future.complete(Result.failed("replacement superseded"));
+            return;
+          }
           Lease held = lease;
           if (held == null || !machineTouched || machine.state() != MachineState.LEASED) {
             future.complete(Result.failed("no held lease; cannot replace"));
             return;
           }
-          // P2: publish the replacing session's barrier synchronously at session
-          // creation so the replacing track's process() can never read the
-          // previous track's retained barrier (stale pre-switch PCM).
-          sessionBarrier = new ActivationBarrier(machine.generation() + 1, uri);
-          this.barrier = sessionBarrier;
-          future.complete(activateInternal(held, uri, positionMs, true, sessionBarrier));
-        } catch (Throwable t) {
-          if (sessionBarrier != null) {
-            sessionBarrier.fail(ActivationException.Kind.FAILED, "replace failed");
+          Result prepared = prepareReplacement();
+          if (!prepared.isOk()) {
+            sessionBarrier.fail(kindOf(prepared), prepared.reason());
+            future.complete(prepared);
+            return;
           }
+          if (requestId != replacementSequence.get()) {
+            sessionBarrier.fail(ActivationException.Kind.CANCELED, "replacement superseded");
+            future.complete(Result.failed("replacement superseded"));
+            return;
+          }
+          discardReplacementPcm();
+          Result activated = activateInternal(held, uri, positionMs, true, sessionBarrier);
+          if (activated.isOk() && remainPaused) {
+            Result paused = awaitMachine(machine.pause(), replacementCommandBudgetMs());
+            if (!paused.isOk()) {
+              sessionBarrier.fail(kindOf(paused), paused.reason());
+              future.complete(paused);
+              return;
+            }
+          }
+          if (requestId != replacementSequence.get()) {
+            sessionBarrier.fail(ActivationException.Kind.CANCELED, "replacement superseded");
+            future.complete(Result.failed("replacement superseded"));
+          } else {
+            future.complete(activated);
+          }
+        } catch (Throwable t) {
+          sessionBarrier.fail(ActivationException.Kind.FAILED, "replace failed");
           future.complete(Result.failed("replace failed: " + sanitize(String.valueOf(t))));
         }
       });
     } catch (RejectedExecutionException e) {
+      sessionBarrier.fail(ActivationException.Kind.CANCELED, "coordinator closed");
       future.complete(Result.failed("coordinator closed"));
     }
     return future;
+  }
+
+  /** Waits for any prior control, then pauses the old session before changing URI. */
+  private Result prepareReplacement() throws InterruptedException {
+    long deadline = System.nanoTime()
+        + TimeUnit.MILLISECONDS.toNanos(replacementCommandBudgetMs());
+    while (true) {
+      if (System.nanoTime() >= deadline) {
+        return Result.failed("replace timed out waiting for command in flight");
+      }
+      if (machine.hasCommandInFlight()) {
+        Thread.sleep(REPLACE_POLL_MS);
+        continue;
+      }
+      if (machine.state() != MachineState.LEASED) {
+        return Result.failed("replace lost active lease (state=" + machine.state() + ")");
+      }
+      switch (machine.phase()) {
+        case PAUSE_CONFIRMED -> {
+          return Result.ok("already paused for replace");
+        }
+        case PLAYING -> {
+          Result paused = awaitMachine(machine.pause(), replacementCommandBudgetMs());
+          if (paused.isOk()) {
+            return paused;
+          }
+          if (paused.reason() == null || !paused.reason().contains("command in flight")) {
+            return paused;
+          }
+        }
+        default -> {
+          // ACTIVATING/PAUSING/RESUMING/SEEKING/COMPLETING are transitional;
+          // the machine lane owns their bounded completion.
+        }
+      }
+      Thread.sleep(REPLACE_POLL_MS);
+    }
+  }
+
+  /** Discards all PCM produced by the old URI after pause reaches a stable empty queue. */
+  private void discardReplacementPcm() throws InterruptedException {
+    FifoReader r = reader;
+    if (r == null) {
+      return;
+    }
+    int discarded = 0;
+    long stableSince = System.nanoTime();
+    long deadline = stableSince + TimeUnit.MILLISECONDS.toNanos(REPLACE_DRAIN_STABLE_MS * 5);
+    while (System.nanoTime() < deadline) {
+      FifoReader.Event event = r.poll();
+      if (event != null) {
+        discarded++;
+        stableSince = System.nanoTime();
+        continue;
+      }
+      if (System.nanoTime() - stableSince
+          >= TimeUnit.MILLISECONDS.toNanos(REPLACE_DRAIN_STABLE_MS)) {
+        break;
+      }
+      Thread.sleep(REPLACE_POLL_MS);
+    }
+    decoder = new PcmDecoder();
+    log("discarded " + discarded + " buffered FIFO events before replace");
+  }
+
+  private Result awaitMachine(CompletableFuture<Result> command, long timeoutMs)
+      throws InterruptedException {
+    try {
+      return command.get(timeoutMs, TimeUnit.MILLISECONDS);
+    } catch (TimeoutException e) {
+      return Result.failed("replace control timed out");
+    } catch (ExecutionException e) {
+      return Result.failed("replace control failed: " + sanitize(String.valueOf(e.getCause())));
+    }
+  }
+
+  private long replacementCommandBudgetMs() {
+    return timing.pauseAckTimeoutMs() + timing.seekAckTimeoutMs()
+        + timing.reconcileTimeoutMs() + ACTIVATION_GRACE_MS;
   }
 
   // ------------------------------------------------------------ barrier + frames

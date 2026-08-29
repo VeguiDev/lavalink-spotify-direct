@@ -87,7 +87,7 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
       }
       desiredUris.put(player, spdirect.daemonUri());
       log.debug("spdirect replace active track with '{}' at {}ms", spdirect.trackId(), position);
-      coordinator.replace(spdirect.daemonUri(), position)
+      coordinator.replace(spdirect.daemonUri(), position, player.isPaused())
           .whenComplete((result, error) -> logCompletion("replace", spdirect.trackId(), result, error));
       return;
     }
@@ -180,7 +180,7 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
           long nextPosition = Math.max(0, next.getPosition());
           log.debug("spdirect replace '{}' with '{}' at {}ms",
               spdirect.trackId(), nextSpdirect.trackId(), nextPosition);
-          coordinator.replace(nextSpdirect.daemonUri(), nextPosition)
+          coordinator.replace(nextSpdirect.daemonUri(), nextPosition, player.isPaused())
               .whenComplete((result, error) ->
                   logCompletion("replace", nextSpdirect.trackId(), result, error));
         } else {

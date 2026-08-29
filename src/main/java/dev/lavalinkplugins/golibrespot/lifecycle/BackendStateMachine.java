@@ -439,6 +439,11 @@ public final class BackendStateMachine implements AutoCloseable {
     return phase;
   }
 
+  /** True while a REST control command still owns the serialized machine lane. */
+  boolean hasCommandInFlight() {
+    return pending != null;
+  }
+
   /** Current event-correlation generation (lockstep with the pool lease generation). */
   public long generation() {
     return generation.get();

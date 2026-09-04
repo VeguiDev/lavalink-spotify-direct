@@ -1,6 +1,7 @@
 package dev.lavalinkplugins.golibrespot.source;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import com.sedmelluq.discord.lavaplayer.filter.PcmFilterFactory;
 import com.sedmelluq.discord.lavaplayer.player.AudioPlayer;
@@ -163,8 +164,26 @@ class PlayerLifecycleBridgeTest {
   void trackEndStoppedCallsLogicalStop() {
     try (Rig rig = newRig()) {
       rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.STOPPED));
-      assertThat(rig.coordinatorA.logicalStops).hasSize(1);
+      await().atMost(Duration.ofSeconds(1))
+          .untilAsserted(() -> assertThat(rig.coordinatorA.logicalStops).hasSize(1));
       assertThat(rig.coordinatorA.destroys).isEmpty();
+    }
+  }
+
+  @Test
+  void stoppedBeforeNextTrackStartIsCancelledAndReplaced() {
+    try (Rig rig = newRig()) {
+      rig.fire(new TrackStartEvent(rig.player, rig.trackA));
+      rig.fire(new TrackEndEvent(rig.player, rig.trackA, AudioTrackEndReason.STOPPED));
+
+      rig.player.playingTrack = rig.trackB;
+      rig.fire(new TrackStartEvent(rig.player, rig.trackB));
+
+      await().during(Duration.ofMillis(200)).atMost(Duration.ofSeconds(1))
+          .untilAsserted(() -> assertThat(rig.coordinatorA.logicalStops).isEmpty());
+      assertThat(rig.coordinatorA.replaces)
+          .containsExactly(new String[] {"spotify:track:" + TRACK_ID_B, "0"});
+      assertThat(rig.trackB.playbackCoordinator()).isSameAs(rig.coordinatorA);
     }
   }
 

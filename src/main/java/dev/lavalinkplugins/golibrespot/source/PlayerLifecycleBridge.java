@@ -11,6 +11,10 @@ import dev.lavalinkplugins.golibrespot.logging.LogSanitizer;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,12 +53,23 @@ import org.slf4j.LoggerFactory;
  */
 public final class PlayerLifecycleBridge extends AudioEventAdapter {
 
+  /** Lets a STOPPED event be superseded by the immediately following track start. */
+  private static final long STOP_GRACE_MS = 100L;
+  private static final ScheduledExecutorService STOP_SCHEDULER =
+      Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "golibrespot-stop-arbiter");
+        thread.setDaemon(true);
+        return thread;
+      });
+
   private final Logger log = LoggerFactory.getLogger(PlayerLifecycleBridge.class);
   private final LogSanitizer sanitizer = LogSanitizer.defaults();
   private final ConcurrentMap<AudioPlayer, PlaybackCoordinator> playerCoordinators =
       new ConcurrentHashMap<>();
   /** URI Lavalink most recently selected for each player, published before async routing. */
   private final ConcurrentMap<AudioPlayer, String> desiredUris = new ConcurrentHashMap<>();
+  /** Stops delayed briefly so a stop-then-play skip can retain the active lease. */
+  private final ConcurrentMap<AudioPlayer, PendingStop> pendingStops = new ConcurrentHashMap<>();
 
   /** Attaches this bridge to a Lavalink player (T19 wiring: {@code onNewPlayer}). */
   public void attach(IPlayer player) {
@@ -67,8 +82,11 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
     Objects.requireNonNull(player, "player");
     AudioPlayer audioPlayer = player.getAudioPlayer();
     audioPlayer.removeListener(this);
-    playerCoordinators.remove(audioPlayer);
-    desiredUris.remove(audioPlayer);
+    synchronized (audioPlayer) {
+      cancelPendingStop(audioPlayer);
+      playerCoordinators.remove(audioPlayer);
+      desiredUris.remove(audioPlayer);
+    }
   }
 
   @Override
@@ -77,6 +95,13 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
     if (spdirect == null) {
       return;
     }
+    synchronized (player) {
+      cancelPendingStop(player);
+      startTrack(player, track, spdirect);
+    }
+  }
+
+  private void startTrack(AudioPlayer player, AudioTrack track, GoLibrespotAudioTrack spdirect) {
     PlaybackCoordinator coordinator = playerCoordinators.get(player);
     if (coordinator != null && coordinator.isActive()) {
       spdirect.setPlaybackCoordinator(coordinator);
@@ -172,44 +197,49 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
         if (!owns(coordinator, spdirect)) {
           return;
         }
-        coordinator.logicalStop()
-            .whenComplete((result, error) -> logCompletion("logicalStop", spdirect.trackId(), result, error));
+        scheduleLogicalStop(player, spdirect, coordinator);
       }
       case REPLACED -> {
-        if (!coordinator.isActive()) {
-          return;
-        }
-        AudioTrack next = player.getPlayingTrack();
-        GoLibrespotAudioTrack nextSpdirect = spdirect(next);
-        if (nextSpdirect != null) {
-          // Play-over-play on the HELD lease: reuse the same coordinator (and pin
-          // the new track to it so process() reads the replaced session), no stop.
-          nextSpdirect.setPlaybackCoordinator(coordinator);
-          playerCoordinators.put(player, coordinator);
-          if (nextSpdirect.daemonUri().equals(desiredUris.get(player))) {
-            return; // onTrackStart already performed the replacement
+        synchronized (player) {
+          cancelPendingStop(player);
+          if (!coordinator.isActive()) {
+            return;
           }
-          desiredUris.put(player, nextSpdirect.daemonUri());
-          long nextPosition = Math.max(0, next.getPosition());
-          log.debug("spdirect replace '{}' with '{}' at {}ms",
-              spdirect.trackId(), nextSpdirect.trackId(), nextPosition);
-          coordinator.replace(nextSpdirect.daemonUri(), nextPosition, player.isPaused())
-              .whenComplete((result, error) ->
-                  logCompletion("replace", nextSpdirect.trackId(), result, error));
-        } else {
-          // Replaced by a foreign track — retire the session gracefully.
-          coordinator.logicalStop()
-              .whenComplete((result, error) -> logCompletion("logicalStop", spdirect.trackId(), result, error));
-          playerCoordinators.remove(player, coordinator);
-          desiredUris.remove(player);
+          AudioTrack next = player.getPlayingTrack();
+          GoLibrespotAudioTrack nextSpdirect = spdirect(next);
+          if (nextSpdirect != null) {
+            // Play-over-play on the HELD lease: reuse the same coordinator (and pin
+            // the new track to it so process() reads the replaced session), no stop.
+            nextSpdirect.setPlaybackCoordinator(coordinator);
+            playerCoordinators.put(player, coordinator);
+            if (nextSpdirect.daemonUri().equals(desiredUris.get(player))) {
+              return; // onTrackStart already performed the replacement
+            }
+            desiredUris.put(player, nextSpdirect.daemonUri());
+            long nextPosition = Math.max(0, next.getPosition());
+            log.debug("spdirect replace '{}' with '{}' at {}ms",
+                spdirect.trackId(), nextSpdirect.trackId(), nextPosition);
+            coordinator.replace(nextSpdirect.daemonUri(), nextPosition, player.isPaused())
+                .whenComplete((result, error) ->
+                    logCompletion("replace", nextSpdirect.trackId(), result, error));
+          } else {
+            // Replaced by a foreign track — retire the session gracefully.
+            coordinator.logicalStop()
+                .whenComplete((result, error) -> logCompletion("logicalStop", spdirect.trackId(), result, error));
+            playerCoordinators.remove(player, coordinator);
+            desiredUris.remove(player);
+          }
         }
       }
       case CLEANUP -> {
-        if (owns(coordinator, spdirect)) {
-          coordinator.destroy()
-              .whenComplete((result, error) -> logCompletion("destroy", spdirect.trackId(), result, error));
-          playerCoordinators.remove(player, coordinator);
-          desiredUris.remove(player);
+        synchronized (player) {
+          cancelPendingStop(player);
+          if (owns(coordinator, spdirect)) {
+            coordinator.destroy()
+                .whenComplete((result, error) -> logCompletion("destroy", spdirect.trackId(), result, error));
+            playerCoordinators.remove(player, coordinator);
+            desiredUris.remove(player);
+          }
         }
       }
       default -> {
@@ -244,6 +274,46 @@ public final class PlayerLifecycleBridge extends AudioEventAdapter {
   }
 
   // ------------------------------------------------------------ helpers
+
+  private void scheduleLogicalStop(
+      AudioPlayer player, GoLibrespotAudioTrack track, PlaybackCoordinator coordinator) {
+    synchronized (player) {
+      cancelPendingStop(player);
+      PendingStop pending = new PendingStop(track, coordinator);
+      pendingStops.put(player, pending);
+      pending.future = STOP_SCHEDULER.schedule(
+          () -> executePendingStop(player, pending), STOP_GRACE_MS, TimeUnit.MILLISECONDS);
+    }
+  }
+
+  private void executePendingStop(AudioPlayer player, PendingStop pending) {
+    synchronized (player) {
+      if (!pendingStops.remove(player, pending) || !owns(pending.coordinator, pending.track)) {
+        return;
+      }
+      pending.coordinator.logicalStop().whenComplete((result, error) ->
+          logCompletion("logicalStop", pending.track.trackId(), result, error));
+    }
+  }
+
+  /** Caller holds the player monitor, except during detach before maps are discarded. */
+  private void cancelPendingStop(AudioPlayer player) {
+    PendingStop pending = pendingStops.remove(player);
+    if (pending != null && pending.future != null) {
+      pending.future.cancel(false);
+    }
+  }
+
+  private static final class PendingStop {
+    private final GoLibrespotAudioTrack track;
+    private final PlaybackCoordinator coordinator;
+    private volatile ScheduledFuture<?> future;
+
+    private PendingStop(GoLibrespotAudioTrack track, PlaybackCoordinator coordinator) {
+      this.track = track;
+      this.coordinator = coordinator;
+    }
+  }
 
   private static GoLibrespotAudioTrack spdirect(AudioTrack track) {
     return track instanceof GoLibrespotAudioTrack spdirect ? spdirect : null;

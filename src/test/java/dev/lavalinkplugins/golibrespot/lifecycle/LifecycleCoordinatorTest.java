@@ -235,6 +235,47 @@ class LifecycleCoordinatorTest {
   }
 
   @Test
+  void replacementDrainsBackpressuredFifoWhileAwaitingPause() throws Exception {
+    try (Rig rig = newRig()) {
+      rig.newPipe();
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_A)));
+      rig.daemon.status(FakeLibrespotDaemon.Response.ok(playingStatus(URI_A)));
+      assertThat(rig.coordinator.start(URI_A, 0).get(5, TimeUnit.SECONDS).isOk()).isTrue();
+
+      // More than the pipe plus FifoReader queue can hold. The writer emits the
+      // pause acknowledgement only after all bytes have crossed the pipe, just
+      // like go-librespot's control loop becoming responsive after backpressure
+      // is relieved. A replacement that merely blocks on the pause future can
+      // never receive this acknowledgement.
+      byte[] oldPcm = new byte[2 * 1024 * 1024];
+      CompletableFuture<Void> writer = CompletableFuture.runAsync(() -> {
+        try {
+          rig.pipeOut().write(oldPcm);
+          rig.pipeOut().flush();
+          rig.daemon.emit("paused", sharedData(URI_A));
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      });
+      await().atMost(Duration.ofSeconds(2))
+          .until(() -> rig.coordinator.currentReader().pendingChunks() > 0);
+
+      rig.daemon.pause(FakeLibrespotDaemon.Response.ok());
+      rig.daemon.status(FakeLibrespotDaemon.Response.hang());
+      rig.daemon.play(FakeLibrespotDaemon.Response.ok().emit("playing", playingData(URI_B)));
+
+      Result replaced = rig.coordinator.replace(URI_B, 0, false).get(5, TimeUnit.SECONDS);
+
+      assertThat(replaced.isOk()).as("replacement under FIFO backpressure: " + replaced).isTrue();
+      writer.get(2, TimeUnit.SECONDS);
+      assertThat(rig.machine.state()).isEqualTo(MachineState.LEASED);
+      assertThat(rig.coordinator.expectedUri()).isEqualTo(URI_B);
+      assertThat(rig.logLines).anyMatch(line -> line.matches(
+          ".*discarded [1-9][0-9]* buffered FIFO events before replace.*"));
+    }
+  }
+
+  @Test
   void replacementStaleAdvanceReissuesPlay() throws Exception {
     try (Rig rig = newRig()) {
       rig.newPipe();

@@ -291,7 +291,8 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
             future.complete(Result.failed("no held lease; cannot replace"));
             return;
           }
-          Result prepared = prepareReplacement();
+          ReplacementPreparation preparation = prepareReplacement();
+          Result prepared = preparation.result();
           if (!prepared.isOk()) {
             sessionBarrier.fail(kindOf(prepared), prepared.reason());
             future.complete(prepared);
@@ -302,7 +303,9 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
             future.complete(Result.failed("replacement superseded"));
             return;
           }
-          discardReplacementPcm();
+          int discarded = preparation.discardedEvents() + discardReplacementPcm();
+          decoder = new PcmDecoder();
+          log("discarded " + discarded + " buffered FIFO events before replace");
           Result activated = activateInternal(held, uri, positionMs, true, sessionBarrier);
           if (activated.isOk() && remainPaused) {
             Result paused = awaitMachine(machine.pause(), replacementCommandBudgetMs());
@@ -331,31 +334,38 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   }
 
   /** Waits for any prior control, then pauses the old session before changing URI. */
-  private Result prepareReplacement() throws InterruptedException {
+  private ReplacementPreparation prepareReplacement() throws InterruptedException {
     long deadline = System.nanoTime()
         + TimeUnit.MILLISECONDS.toNanos(replacementCommandBudgetMs());
+    int discarded = 0;
     while (true) {
+      discarded += discardAvailableReplacementPcm();
       if (System.nanoTime() >= deadline) {
-        return Result.failed("replace timed out waiting for command in flight");
+        return new ReplacementPreparation(
+            Result.failed("replace timed out waiting for command in flight"), discarded);
       }
       if (machine.hasCommandInFlight()) {
         Thread.sleep(REPLACE_POLL_MS);
         continue;
       }
       if (machine.state() != MachineState.LEASED) {
-        return Result.failed("replace lost active lease (state=" + machine.state() + ")");
+        return new ReplacementPreparation(
+            Result.failed("replace lost active lease (state=" + machine.state() + ")"), discarded);
       }
       switch (machine.phase()) {
         case PAUSE_CONFIRMED -> {
-          return Result.ok("already paused for replace");
+          return new ReplacementPreparation(Result.ok("already paused for replace"), discarded);
         }
         case PLAYING -> {
-          Result paused = awaitMachine(machine.pauseForReplacement(), replacementCommandBudgetMs());
+          AwaitedResult awaited = awaitMachineWhileDraining(
+              machine.pauseForReplacement(), replacementCommandBudgetMs());
+          discarded += awaited.discardedEvents();
+          Result paused = awaited.result();
           if (paused.isOk()) {
-            return paused;
+            return new ReplacementPreparation(paused, discarded);
           }
           if (paused.reason() == null || !paused.reason().contains("command in flight")) {
-            return paused;
+            return new ReplacementPreparation(paused, discarded);
           }
         }
         default -> {
@@ -368,10 +378,10 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
   }
 
   /** Discards all PCM produced by the old URI after pause reaches a stable empty queue. */
-  private void discardReplacementPcm() throws InterruptedException {
+  private int discardReplacementPcm() throws InterruptedException {
     FifoReader r = reader;
     if (r == null) {
-      return;
+      return 0;
     }
     int discarded = 0;
     long stableSince = System.nanoTime();
@@ -389,8 +399,47 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
       }
       Thread.sleep(REPLACE_POLL_MS);
     }
-    decoder = new PcmDecoder();
-    log("discarded " + discarded + " buffered FIFO events before replace");
+    return discarded;
+  }
+
+  /** Keeps the daemon's FIFO writer unblocked while a replacement control is pending. */
+  private AwaitedResult awaitMachineWhileDraining(
+      CompletableFuture<Result> command, long timeoutMs) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+    int discarded = 0;
+    while (true) {
+      discarded += discardAvailableReplacementPcm();
+      long remainingNanos = deadline - System.nanoTime();
+      if (remainingNanos <= 0) {
+        return new AwaitedResult(Result.failed("replace control timed out"), discarded);
+      }
+      long waitMs = Math.max(1L, Math.min(
+          REPLACE_POLL_MS, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+      try {
+        Result result = command.get(waitMs, TimeUnit.MILLISECONDS);
+        discarded += discardAvailableReplacementPcm();
+        return new AwaitedResult(result, discarded);
+      } catch (TimeoutException ignored) {
+        // Continue draining until the command completes or its outer budget expires.
+      } catch (ExecutionException e) {
+        return new AwaitedResult(
+            Result.failed("replace control failed: " + sanitize(String.valueOf(e.getCause()))),
+            discarded);
+      }
+    }
+  }
+
+  /** Drains one bounded batch so an unpaced producer cannot monopolize the coordinator lane. */
+  private int discardAvailableReplacementPcm() {
+    FifoReader r = reader;
+    if (r == null) {
+      return 0;
+    }
+    int discarded = 0;
+    while (discarded < 256 && r.poll() != null) {
+      discarded++;
+    }
+    return discarded;
   }
 
   private Result awaitMachine(CompletableFuture<Result> command, long timeoutMs)
@@ -403,6 +452,10 @@ public final class LifecycleCoordinator implements BackendStateMachine.Lifecycle
       return Result.failed("replace control failed: " + sanitize(String.valueOf(e.getCause())));
     }
   }
+
+  private record ReplacementPreparation(Result result, int discardedEvents) {}
+
+  private record AwaitedResult(Result result, int discardedEvents) {}
 
   private long replacementCommandBudgetMs() {
     return timing.pauseAckTimeoutMs() + timing.seekAckTimeoutMs()
